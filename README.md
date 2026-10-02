@@ -1,0 +1,63 @@
+# neo-git
+
+Emacs 用の小さな非同期 Git インターフェースです。左に変更一覧、右に選択ファイルの差分を表示し、ファイル・行・hunk 単位のステージ操作ができます。
+
+Emacs 29.1 以上と PATH 上の Git が必要です。依存する Lisp ライブラリは Emacs 標準のものだけです。Evil は任意で、通常の Emacs でも使えます。
+
+## インストール
+
+Emacs 29 以上の `package-vc-install` でインストールできます。
+
+```elisp
+(package-vc-install "https://github.com/siroio/neo-git")
+```
+
+Emacs 30 以上では `use-package` でも設定できます。
+
+```elisp
+(use-package neo-git
+  :vc (:url "https://github.com/siroio/neo-git" :rev :newest)
+  :commands neo-git-status
+  :bind ("C-x g" . neo-git-status))
+```
+
+ダウンロードした `neo-git.el` を `M-x package-install-file` でインストールすることもできます。
+
+## 操作
+
+Git リポジトリ内のファイルやディレクトリから `M-x neo-git-status` を実行します。
+
+| キー | 操作 |
+| --- | --- |
+| `j` / `k` | 一覧ではファイル、差分では行を移動 |
+| `v` / `V` | 文字・行単位の範囲選択 |
+| `SPC` | 選択ファイル／差分の選択行・hunk をステージ／解除 |
+| `a` | 一覧のステージ状態を全件切替／差分の行・hunk 選択を切替 |
+| `RET` / `TAB` | 差分を開く／一覧と差分を切替 |
+| `J` / `K` | 差分から前後のファイルへ移動 |
+| `e` | 選択ファイル／差分に対応する作業ファイルの行を開く |
+| `c` | コミットメッセージを編集 |
+| `C-c C-c` / `C-c C-k` | コミットを確定／中止（メッセージ編集時） |
+| `f` / `F` / `p` | fetch / pull / push |
+| `r` / `R` | 更新 |
+| `/` | パス検索 |
+| `@` | 最近の Git コマンドとエラーを表示 |
+| `?` | キー案内 |
+| `q` | 一覧では Git 画面を終了、差分では一覧へ戻る |
+
+部分ステージは追跡済みの通常テキスト差分に対応し、Git の index だけを変更します。未追跡ファイルは一覧からファイル単位でステージしてください。rename、競合、binary、mode 変更、新規・削除ファイルの部分操作は拒否します。
+
+コミットの作者は対象リポジトリの Git 設定に従います。`neo-emacs` と併用する場合、`,` は既存の `neo-leader-map` に接続します。
+
+## 検証
+
+```sh
+emacs -Q --batch -l check-package.el
+emacs -Q --batch -l check-git.el
+```
+
+`check-package.el` は一時的な package ディレクトリへインストールし、autoload と標準ライブラリだけでの起動を確認します。`check-git.el` は一時 Git リポジトリでステージ・部分操作・commit・fetch・pull・push などを検証します。`benchmark-git.el` は既存の検証が使用するプロセス計測コードです。
+
+## ライセンス
+
+GPL-3.0-or-later。ライセンス全文は [COPYING](COPYING) を参照してください。
