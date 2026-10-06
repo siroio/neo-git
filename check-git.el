@@ -471,7 +471,8 @@
                                     (not neo-git--mutation))))
             (cl-assert (buffer-live-p commit-buffer))
             (with-current-buffer commit-buffer
-              (cl-assert (equal (buffer-string) "保存された日本語 message")))
+              (cl-assert (string-prefix-p "保存された日本語 message\n\n# " (buffer-string)))
+              (cl-assert (string-match-p "^#\t.+$" (buffer-string))))
             (delete-file hook)
             (neo-git-commit-finish)
             (neo-git-check-wait (lambda ()

@@ -1800,11 +1800,25 @@ Unstaged files are restored from the index; untracked files are deleted."
                          (eq (plist-get e :kind) 'staged)) neo-git-entries))
     (user-error "Stage changes before committing"))
   (let* ((status-buffer (current-buffer))
+         (staged (seq-filter (lambda (e) (eq (plist-get e :kind) 'staged)) neo-git-entries))
          (buffer (get-buffer-create (format "*Neo Git Commit: %s*"
                                             (directory-file-name neo-git-root)))))
     (with-current-buffer buffer
       (unless (eq major-mode 'text-mode)
         (text-mode))
+      ;; Like git commit: a '#' summary of staged files, stripped on finish.
+      (save-excursion
+        (goto-char (point-min))
+        (flush-lines "^#")
+        (goto-char (point-max))
+        (skip-chars-backward " \t\n")
+        (delete-region (point) (point-max))
+        (insert "\n\n# Lines starting with '#' are ignored.\n# Changes to be committed:\n")
+        (dolist (entry staged)
+          (insert "#\t" (if (plist-get entry :old-path)
+                            (format "%s -> " (plist-get entry :old-path))
+                          "")
+                  (plist-get entry :path) "\n")))
       (setq-local neo-git--commit-status-buffer status-buffer
                   neo-git--commit-root (buffer-local-value 'neo-git-root status-buffer))
       (use-local-map (copy-keymap text-mode-map))
@@ -1819,7 +1833,7 @@ Unstaged files are restored from the index; untracked files are deleted."
 
 (defun neo-git-commit-finish ()
   (interactive)
-  (let ((message-text (string-trim (buffer-string)))
+  (let ((message-text (string-trim (replace-regexp-in-string "^#.*\n?" "" (buffer-string))))
         (status-buffer neo-git--commit-status-buffer))
     (when (string-empty-p message-text)
       (user-error "Commit message is empty"))
