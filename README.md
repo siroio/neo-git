@@ -1,6 +1,6 @@
 # neo-git
 
-Emacs 用の小さな非同期 Git インターフェースです。左に変更一覧、右に選択ファイルの差分を表示し、ファイル・行・hunk 単位のステージ操作ができます。
+Emacs 用の小さな非同期 Git インターフェースです。フレーム全体を使い、左上に変更一覧、左下にマージの推移線付きコミット履歴、右に選択ファイルの差分を表示します。ファイル・行・hunk 単位のステージ操作ができます。閉じると元のウィンドウ配置に戻ります。
 
 Emacs 29.1 以上と PATH 上の Git が必要です。依存する Lisp ライブラリは Emacs 標準のものだけです。Evil は任意で、通常の Emacs でも使えます。
 
@@ -41,6 +41,9 @@ Git リポジトリ内のファイルやディレクトリから `M-x neo-git-st
 | `f` / `F` / `p` | fetch / pull / push |
 | `r` / `R` | 更新 |
 | `/` | パス検索 |
+| `l` | 履歴ペインへ移動（`RET` でコミットの差分を右に表示、`q` / `TAB` で一覧へ戻る） |
+| `b` / `B` | ブランチ切替／作成 |
+| `z` | stash の保存・一覧（一覧で `a` 適用、`d` 削除） |
 | `@` | 最近の Git コマンドとエラーを表示 |
 | `?` | キー案内 |
 | `q` | 一覧では Git 画面を終了、差分では一覧へ戻る |
@@ -54,9 +57,10 @@ Git リポジトリ内のファイルやディレクトリから `M-x neo-git-st
 ```sh
 emacs -Q --batch -l check-package.el
 emacs -Q --batch -l check-git.el
+emacs -Q --batch -l check-git-workflows.el
 ```
 
-`check-package.el` は一時的な package ディレクトリへインストールし、autoload と標準ライブラリだけでの起動を確認します。`check-git.el` は一時 Git リポジトリでステージ・部分操作・commit・fetch・pull・push などを検証します。`benchmark-git.el` は既存の検証が使用するプロセス計測コードです。
+`check-package.el` は一時的な package ディレクトリへインストールし、autoload と標準ライブラリだけでの起動を確認します。`check-git.el` は一時 Git リポジトリでステージ・部分操作・commit・fetch・pull・push などを検証します。`check-git-workflows.el` は履歴グラフ・ブランチ・stash を検証します。`benchmark-git.el` は既存の検証が使用するプロセス計測コードです。
 
 ## ライセンス
 

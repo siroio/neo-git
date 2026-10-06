@@ -3,7 +3,7 @@
 ;; Author: siroio <74674262+siroio@users.noreply.github.com>
 ;; Maintainer: siroio <74674262+siroio@users.noreply.github.com>
 ;; URL: https://github.com/siroio/neo-git
-;; Version: 0.2
+;; Version: 0.3
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: tools, vc
 ;; SPDX-License-Identifier: GPL-3.0-or-later
@@ -18,6 +18,7 @@
 (require 'seq)
 (require 'diff-mode)
 (require 'hl-line)
+(require 'tabulated-list)
 
 ;;; Buffer state
 
@@ -59,6 +60,8 @@
 (defvar-local neo-git--last-error nil)
 (defvar-local neo-git--preview-buffer nil)
 (defvar-local neo-git--preview-window nil)
+(defvar-local neo-git--history-window nil)
+(defvar-local neo-git--window-config nil)
 (defvar-local neo-git--narrow nil)
 (defvar-local neo-git--current-selection nil)
 (defvar-local neo-git--visual-inclusive nil)
@@ -181,7 +184,7 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
             (setq process
                   (make-process :name "neo-git" :buffer out :stderr err
                                 :command (cons (neo-git--executable)
-                                               (append (list "-C" directory) arguments))
+                                               (append (list "-C" (expand-file-name directory)) arguments))
                                 :connection-type 'pipe :noquery t
                                 :coding (if (eq system-type 'windows-nt)
                                             (cons 'utf-8-unix
@@ -654,7 +657,10 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
             (neo-git--refresh-now buffer))
         (if (and (integerp status) (zerop status))
             (let ((state (neo-git--parse-status output))
-                  (id (neo-git--selected-id)))
+                  (id (neo-git--selected-id))
+                  (old-oid (plist-get neo-git-state :oid)))
+              (when (and old-oid (not (equal old-oid (plist-get state :oid))))
+                (neo-git--refresh-browsers buffer 'history))
               (setq neo-git-state state
                     neo-git-entries (plist-get state :entries))
               (neo-git--render (and id (list :path (car id) :kind (cadr id))))
@@ -721,10 +727,22 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
                          (setq neo-git-root root)
                          (setq neo-git--closed nil)
                          (neo-git--render))
-                       (pop-to-buffer buffer)
-                       (with-current-buffer buffer
-                         (neo-git--ensure-preview))
+                       (neo-git--layout buffer)
                        (neo-git-refresh))))))
+
+(defun neo-git--layout (buffer)
+  "Show status BUFFER full-frame: list and history on the left, diff on the right."
+  (with-current-buffer buffer
+    (unless (get-buffer-window buffer)
+      (setq neo-git--window-config (current-window-configuration))))
+  ;; Popping into the current layout could land in a short bottom split.
+  (select-window (or (get-largest-window nil nil t) (frame-first-window)))
+  (let ((ignore-window-parameters t))
+    (delete-other-windows))
+  (switch-to-buffer buffer nil t)
+  (neo-git--ensure-preview)
+  (setq neo-git--history-window (split-window nil nil 'below))
+  (set-window-buffer neo-git--history-window (neo-git--browser-buffer 'history buffer)))
 
 ;;; Diff preview and navigation
 
@@ -1542,12 +1560,18 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
       (delete-process neo-git--diff-process))
     (setq neo-git--diff-process nil)
     (neo-git--invalidate-stage-prefetch)
-    (when (and (window-live-p preview-window)
-               (eq (window-buffer preview-window) preview)
-               (> (length (window-list nil 'no-minibuffer)) 1))
-      (delete-window preview-window))
-    (setq neo-git--preview-window nil)
-    (quit-window)
+    (setq neo-git--preview-window nil
+          neo-git--history-window nil)
+    (if (window-configuration-p neo-git--window-config)
+        (progn
+          (set-window-configuration (prog1 neo-git--window-config
+                                      (setq neo-git--window-config nil)))
+          (bury-buffer owner))
+      (when (and (window-live-p preview-window)
+                 (eq (window-buffer preview-window) preview)
+                 (> (length (window-list nil 'no-minibuffer)) 1))
+        (delete-window preview-window))
+      (quit-window))
     ;; In a narrow layout the preview replaced the list in one window.  Its
     ;; window history can therefore make quit-window select that preview again.
     (when (and (buffer-live-p preview) (eq (current-buffer) preview))
@@ -1566,9 +1590,10 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
 
 ;;; Index changes and commit
 
-(defun neo-git--mutate (arguments &optional label prefetch)
+(defun neo-git--mutate (arguments &optional label prefetch worktree)
   (when neo-git--mutation
     (user-error "Git operation already running"))
+  (when worktree (neo-git--worktree-ready))
   ;; A preview read started before this write must never publish against a
   ;; changed index, including when no next-file prefetch is available.
   (neo-git--invalidate-stage-prefetch)
@@ -1589,6 +1614,9 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
                                (setq neo-git--mutation nil
                                      neo-git--mutation-label nil)
                                (neo-git--progress-stop)
+                               (when worktree (neo-git--revert-worktree-buffers))
+                               (when (or worktree (equal (car arguments) "stash"))
+                                 (neo-git--refresh-browsers buffer))
                                (unless neo-git--closed
                                  (if (and (integerp status) (zerop status))
                                      (progn
@@ -1611,7 +1639,9 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
                                              (format "Git exited with status %s" status)
                                            (string-trim error-output)))
                                    (message "Neo Git failed: %s" neo-git--last-error)
-                                   (neo-git--render)))))))))
+                                   (if worktree
+                                       (neo-git--refresh-now buffer)
+                                     (neo-git--render))))))))))
       (when (and neo-git--mutation (process-live-p process))
         (neo-git--progress-set-process process)))))
 
@@ -1865,6 +1895,321 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
     (neo-git--mutate (append '("push" "--progress" "--set-upstream")
                              (list (car target) (concat "HEAD:refs/heads/" (cadr target))))
                      (format "push %s/%s" (car target) (cadr target)))))
+
+;;; History, branches and stash
+
+(defvar-local neo-git--browser-kind nil)
+(defvar-local neo-git--browser-process nil)
+(defvar-local neo-git--browser-generation 0)
+
+(defvar neo-git-browser-mode-map
+  (let ((map (make-sparse-keymap)))
+    (set-keymap-parent map tabulated-list-mode-map)
+    (define-key map (kbd "RET") #'neo-git-browser-show)
+    (define-key map (kbd "r") #'neo-git-browser-refresh)
+    (define-key map (kbd "j") #'next-line)
+    (define-key map (kbd "k") #'previous-line)
+    (define-key map (kbd "a") #'neo-git-stash-apply)
+    (define-key map (kbd "d") #'neo-git-stash-drop)
+    (define-key map (kbd "q") #'neo-git-browser-quit)
+    (define-key map (kbd "TAB") #'neo-git-browser-quit)
+    (define-key map (kbd "<backtab>") #'neo-git-browser-quit)
+    map))
+
+(defface neo-git-graph-face '((t (:inherit font-lock-keyword-face)))
+  "Face for the commit graph in Neo Git history."
+  :group 'neo-git)
+(defface neo-git-ref-face '((t (:inherit font-lock-constant-face :weight bold)))
+  "Face for branch and tag names in Neo Git history."
+  :group 'neo-git)
+
+(define-derived-mode neo-git-browser-mode tabulated-list-mode "Neo-Git-Browse"
+  "Browse commits or stash entries. RET: diff; r: refresh; q: return.
+In stash lists, a: apply without deleting; d: delete with confirmation."
+  (setq-local truncate-lines t)
+  (when (fboundp 'evil-define-key*)
+    (evil-define-key* '(normal motion) neo-git-browser-mode-map
+      (kbd "RET") #'neo-git-browser-show (kbd "r") #'neo-git-browser-refresh
+      (kbd "j") #'next-line (kbd "k") #'previous-line
+      (kbd "a") #'neo-git-stash-apply (kbd "d") #'neo-git-stash-drop
+      (kbd "TAB") #'neo-git-browser-quit (kbd "<backtab>") #'neo-git-browser-quit
+      (kbd "q") #'neo-git-browser-quit (kbd "<escape>") #'neo-git-browser-quit)))
+
+(defun neo-git-browser-quit ()
+  "Return to the status list from the pinned history pane, else quit the window."
+  (interactive)
+  (let ((owner neo-git--diff-owner))
+    (if (and (buffer-live-p owner)
+             (eq (selected-window) (buffer-local-value 'neo-git--history-window owner)))
+        (neo-git-focus-list)
+      (quit-window))))
+
+(defun neo-git--refresh-browsers (owner &optional kind)
+  "Refresh OWNER's browser buffers, only those of KIND when non-nil."
+  (dolist (browser (buffer-list))
+    (with-current-buffer browser
+      (when (and (derived-mode-p 'neo-git-browser-mode)
+                 (eq neo-git--diff-owner owner)
+                 (or (null kind) (eq neo-git--browser-kind kind)))
+        (neo-git-browser-refresh)))))
+
+(defun neo-git--status-owner ()
+  (let ((owner (or (neo-git--owner-buffer) (current-buffer))))
+    (unless (and (buffer-live-p owner)
+                 (with-current-buffer owner
+                   (and (derived-mode-p 'neo-git-mode) neo-git-root
+                        (not neo-git--closed))))
+      (user-error "Open a Neo Git status buffer first"))
+    owner))
+
+(defun neo-git--worktree-ready ()
+  "Refuse worktree writes during a Git operation or unsaved file editing."
+  (when neo-git--mutation (user-error "Git operation already running"))
+  (when (neo-git--in-progress-p)
+    (user-error "Finish the current merge/rebase before changing the worktree"))
+  (let ((root neo-git-root))
+    (dolist (buffer (buffer-list))
+      (with-current-buffer buffer
+        (when (and buffer-file-name (buffer-modified-p)
+                   (file-in-directory-p buffer-file-name root))
+          (user-error "Save or discard edits first: %s" buffer-file-name))))))
+
+(defun neo-git--revert-worktree-buffers ()
+  (let ((root neo-git-root))
+    (dolist (buffer (buffer-list))
+      (with-current-buffer buffer
+        (when (and buffer-file-name (not (buffer-modified-p))
+                   (file-in-directory-p buffer-file-name root)
+                   (file-exists-p buffer-file-name))
+          (condition-case err
+              (revert-buffer t t t)
+            (error (message "Cannot reload %s: %s" buffer-file-name
+                            (error-message-string err)))))))))
+
+(defun neo-git--browser-buffer (kind owner)
+  "Return OWNER's browser buffer of KIND, starting its refresh."
+  (let* ((root (buffer-local-value 'neo-git-root owner))
+         (buffer (get-buffer-create (format "*Neo Git %s: %s*" kind root))))
+    (with-current-buffer buffer
+      (unless (derived-mode-p 'neo-git-browser-mode) (neo-git-browser-mode))
+      (setq neo-git-root root default-directory root
+            neo-git--diff-owner owner neo-git--browser-kind kind
+            tabulated-list-format
+            (if (eq kind 'history)
+                ;; Unsortable: sorting would scramble the graph.
+                (vector (list "Graph" 1 nil) (list "Commit" 8 nil)
+                        (list "Date" 11 nil) (list "Subject" 0 nil))
+              [("Stash" 16 t) ("Subject" 0 t)]))
+      (tabulated-list-init-header)
+      (neo-git-browser-refresh))
+    buffer))
+
+(defun neo-git--browse (kind)
+  (let* ((owner (neo-git--status-owner))
+         (buffer (neo-git--browser-buffer kind owner))
+         (window (and (eq kind 'history)
+                      (buffer-local-value 'neo-git--history-window owner))))
+    (if (window-live-p window)
+        (progn (set-window-buffer window buffer)
+               (select-window window))
+      (pop-to-buffer buffer))))
+
+(defun neo-git--history-entries (output)
+  "Parse `git log --graph' OUTPUT into tabulated entries.
+Graph-only connector rows such as \"|\\\" have no commit id."
+  (let ((rows
+         (mapcar
+          (lambda (line)
+            (let* ((separator (string-search "\x1f" line))
+                   (graph (propertize (string-trim-right (substring line 0 separator))
+                                      'face 'neo-git-graph-face))
+                   (fields (and separator
+                                (split-string (substring line (1+ separator)) "\x1f"))))
+              (if (null fields)
+                  (list nil (vector graph "" "" ""))
+                (list (nth 0 fields)
+                      (vector graph
+                              (propertize (nth 1 fields) 'face 'font-lock-comment-face)
+                              (nth 2 fields)
+                              (concat (unless (string-empty-p (nth 3 fields))
+                                        (propertize (format "(%s) " (nth 3 fields))
+                                                    'face 'neo-git-ref-face))
+                                      (string-join (nthcdr 4 fields) " ")))))))
+          (split-string output "\n" t))))
+    (setf (cadr (aref tabulated-list-format 0))
+          (apply #'max 1 (mapcar (lambda (row) (length (aref (cadr row) 0))) rows)))
+    rows))
+
+(defun neo-git-history ()
+  "Show the latest 100 commits on the current branch with their graph."
+  (interactive)
+  (neo-git--browse 'history))
+
+(defun neo-git-stash-list ()
+  "Browse saved stash entries."
+  (interactive)
+  (neo-git--browse 'stash))
+
+(defun neo-git-browser-refresh ()
+  (interactive)
+  (let ((buffer (current-buffer))
+        (generation (cl-incf neo-git--browser-generation)))
+    (when (process-live-p neo-git--browser-process)
+      (delete-process neo-git--browser-process))
+    (setq header-line-format " Loading…")
+    (setq neo-git--browser-process
+          (neo-git--run
+           neo-git-root
+           (if (eq neo-git--browser-kind 'history)
+               '("log" "--graph" "-100" "--date=short" "--color=never"
+                 "--format=%x1f%H%x1f%h%x1f%ad%x1f%D%x1f%s")
+             '("stash" "list" "--format=%H%x09%gd%x09%gs"))
+           (lambda (status output errors)
+             (when (buffer-live-p buffer)
+               (with-current-buffer buffer
+                 (when (= generation neo-git--browser-generation)
+                   (setq neo-git--browser-process nil)
+                   (if (not (eq status 0))
+                       (setq header-line-format
+                             (neo-git--mode-line-literal (concat " " errors)))
+                     (setq tabulated-list-entries
+                           (if (eq neo-git--browser-kind 'history)
+                               (neo-git--history-entries output)
+                           (mapcar
+                            (lambda (line)
+                              (let* ((fields (split-string line "\t"))
+                                     (columns (if (eq neo-git--browser-kind 'history) 3 2)))
+                                (list (car fields)
+                                      (vconcat (seq-take (cdr fields) (1- columns))
+                                               (list (mapconcat #'identity
+                                                                (nthcdr columns fields) "\t"))))))
+                            (split-string output "\n" t))))
+                     (setq header-line-format
+                           (if tabulated-list-entries
+                               (if (eq neo-git--browser-kind 'stash)
+                                   " RET: diff  a: apply (keep stash)  d: delete  r: refresh  q: back"
+                                 " Latest 100 commits  RET: diff  r: refresh  q/TAB: list")
+                             " No entries  r: refresh  q: back"))
+                     (tabulated-list-print t))))))))))
+
+(defun neo-git-browser-show ()
+  "Show the selected commit or stash without enabling index changes."
+  (interactive)
+  (let* ((oid (or (tabulated-list-get-id) (user-error "Select an entry")))
+         (buffer (get-buffer-create (format "*Neo Git Show: %s*" oid)))
+         (args (if (eq neo-git--browser-kind 'stash)
+                   (list "stash" "show" "-p" "--include-untracked")
+                 '("show" "--format=fuller"))))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t)) (erase-buffer) (insert "Loading…\n"))
+      (diff-mode)
+      (setq buffer-read-only t)
+      (let ((map (make-sparse-keymap)))
+        (set-keymap-parent map diff-mode-map)
+        (define-key map (kbd "q") #'quit-window)
+        (define-key map (kbd "<escape>") #'quit-window)
+        (use-local-map map)
+        (when (fboundp 'evil-define-key*)
+          (evil-define-key* '(normal motion) map
+            (kbd "q") #'quit-window (kbd "<escape>") #'quit-window))))
+    (neo-git--run
+     neo-git-root (append args '("--no-ext-diff" "--no-textconv" "--no-color") (list oid))
+     (lambda (status output errors)
+       (when (buffer-live-p buffer)
+         (with-current-buffer buffer
+           (let ((inhibit-read-only t))
+             (erase-buffer) (insert (if (eq status 0) output errors))
+             (goto-char (point-min)))))))
+    (let ((window (and (buffer-live-p neo-git--diff-owner)
+                       (buffer-local-value 'neo-git--preview-window neo-git--diff-owner))))
+      (if (window-live-p window)
+          (progn (select-window window)
+                 (switch-to-buffer buffer nil t))
+        (pop-to-buffer buffer)))))
+
+(defun neo-git-switch-branch ()
+  "Select and switch to an existing local branch without forcing."
+  (interactive)
+  (let ((owner (neo-git--status-owner)))
+    (with-current-buffer owner
+      (neo-git--worktree-ready)
+      (neo-git--run
+       neo-git-root '("for-each-ref" "--format=%(refname:short)" "refs/heads/")
+       (lambda (status output errors)
+         (when (buffer-live-p owner)
+           (with-current-buffer owner
+             (unless neo-git--closed
+               (if (not (eq status 0)) (message "Neo Git: %s" errors)
+                 (let* ((branches (split-string output "\n" t))
+                        (branch (completing-read "Switch branch: " branches nil t)))
+                   (unless (member branch branches) (user-error "Select a local branch"))
+                   (neo-git--mutate (list "switch" "--" branch)
+                                    (concat "switch " branch) nil t)))))))))))
+
+(defun neo-git-create-branch ()
+  "Create a branch at HEAD and switch to it."
+  (interactive)
+  (with-current-buffer (neo-git--status-owner)
+    (neo-git--worktree-ready)
+    (let ((branch (read-string "New branch: ")))
+      (when (or (string-empty-p branch) (string-prefix-p "-" branch)
+                (not (zerop (process-file (neo-git--executable) nil nil nil
+                                         "check-ref-format" "--branch" branch))))
+        (user-error "Invalid branch name: %s" branch))
+      (neo-git--mutate (list "switch" "-c" branch) (concat "create " branch) nil t))))
+
+(defun neo-git-stash-save ()
+  "Save changes, optionally including untracked files."
+  (interactive)
+  (with-current-buffer (neo-git--status-owner)
+    (neo-git--worktree-ready)
+    (let* ((message (read-string "Stash message: "))
+           (untracked (y-or-n-p "Include untracked files? ")))
+      (neo-git--mutate (append '("stash" "push") (when untracked '("--include-untracked"))
+                               (list "-m" message)) "stash save" nil t))))
+
+(defun neo-git-stash-apply ()
+  "Restore the selected stash, preserving it and its staged state."
+  (interactive)
+  (unless (eq neo-git--browser-kind 'stash) (user-error "Open the stash list first"))
+  (let ((oid (or (tabulated-list-get-id) (user-error "Select a stash"))))
+    (with-current-buffer (neo-git--status-owner)
+      (neo-git--mutate (list "stash" "apply" "--index" oid) "stash apply (keep)" nil t))))
+
+(defun neo-git-stash-drop ()
+  "Delete the selected stash after confirmation and checking its current identity."
+  (interactive)
+  (unless (eq neo-git--browser-kind 'stash) (user-error "Open the stash list first"))
+  (let* ((oid (or (tabulated-list-get-id) (user-error "Select a stash")))
+         (ref (aref (tabulated-list-get-entry) 0))
+         (owner (neo-git--status-owner)))
+    (when (yes-or-no-p (format "Permanently delete %s (%s)? " ref (substring oid 0 12)))
+      (neo-git--run
+       neo-git-root (list "rev-parse" "--verify" ref)
+       (lambda (status output _errors)
+         (when (buffer-live-p owner)
+           (with-current-buffer owner
+             (unless neo-git--closed
+               (if (and (eq status 0) (equal oid (string-trim output)))
+                   (neo-git--mutate (list "stash" "drop" ref) (concat "drop " ref))
+                 (message "Stash list changed; refresh before deleting"))))))))))
+
+(defun neo-git-stash ()
+  "Choose a stash operation."
+  (interactive)
+  (pcase (read-char-choice "Stash: [s] save  [l] list/apply/delete  [q] cancel " '(?s ?l ?q))
+    (?s (neo-git-stash-save))
+    (?l (neo-git-stash-list))))
+
+(dolist (map (list neo-git-mode-map neo-git-diff-mode-map))
+  (dolist (binding '(("l" . neo-git-history) ("b" . neo-git-switch-branch)
+                     ("B" . neo-git-create-branch) ("z" . neo-git-stash)))
+    (define-key map (kbd (car binding)) (cdr binding))))
+(with-eval-after-load 'evil
+  (dolist (map (list neo-git-mode-map neo-git-diff-mode-map))
+    (evil-define-key* '(normal motion) map
+      (kbd "l") #'neo-git-history (kbd "b") #'neo-git-switch-branch
+      (kbd "B") #'neo-git-create-branch (kbd "z") #'neo-git-stash)))
 
 (provide 'neo-git)
 ;;; neo-git.el ends here

@@ -12,7 +12,7 @@
       (progn
         (package-initialize)
         (package-install-file source)
-        (cl-assert (package-installed-p 'neo-git '(0 2)))
+        (cl-assert (package-installed-p 'neo-git '(0 3)))
         (cl-assert (autoloadp (symbol-function 'neo-git-status)))
         (cl-assert (not (boundp 'neo-leader-map)))
         (require 'neo-git)
