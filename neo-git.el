@@ -660,8 +660,11 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
         (if (and (integerp status) (zerop status))
             (let ((state (neo-git--parse-status output))
                   (id (neo-git--selected-id))
-                  (old-oid (plist-get neo-git-state :oid)))
-              (when (and old-oid (not (equal old-oid (plist-get state :oid))))
+                  (head (lambda (s) (mapcar (lambda (k) (plist-get s k))
+                                            '(:oid :branch :upstream :ahead :behind)))))
+              ;; Commit, pull, push, fetch and branch switches all move one of these.
+              (when (and neo-git-state
+                         (not (equal (funcall head neo-git-state) (funcall head state))))
                 (neo-git--refresh-browsers buffer 'history))
               (setq neo-git-state state
                     neo-git-entries (plist-get state :entries))
