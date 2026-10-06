@@ -33,7 +33,7 @@ Git リポジトリ内のファイルやディレクトリから `M-x neo-git-st
 | --- | --- |
 | `j` / `k` | 一覧ではファイル、差分では行を移動 |
 | `v` / `V` | 文字・行単位の範囲選択 |
-| `SPC` | 選択ファイル／差分の選択行・hunk をステージ／解除 |
+| `SPC` | 選択ファイル／差分の選択行・hunk をステージ／解除（コンフリクトはマーカーを消すと解決済みとしてステージ可能） |
 | `d` | 選択ファイル／差分の選択行・hunk の変更を破棄（確認あり、未追跡ファイルは削除） |
 | `a` | 一覧のステージ状態を全件切替／差分の行・hunk 選択を切替 |
 | `RET` / `TAB` | 差分を開く／一覧と差分を切替 |
@@ -44,8 +44,10 @@ Git リポジトリ内のファイルやディレクトリから `M-x neo-git-st
 | `f` / `p` / `P` | fetch / pull / push |
 | `r` / `R` | 更新 |
 | `/` | パス検索 |
-| `l` / `4` | 履歴ペインへ移動（`RET` でコミットの差分を右に表示、`q` / `TAB` で一覧へ戻る） |
+| `l` / `4` | 履歴ペインへ移動（`RET` でコミットの差分を右に表示、`C` で cherry-pick、`q` / `TAB` で一覧へ戻る） |
 | `b` / `3` / `B` | ブランチ切替／作成 |
+| `m` / `M` | ブランチを merge／現在のブランチを rebase |
+| `A` | 進行中の merge・rebase・cherry-pick を continue／abort／skip |
 | `s` / `S` / `5` | stash 保存／stash メニュー／stash 一覧（一覧で `SPC` 適用、`d` 削除） |
 | `@` | 最近の Git コマンドとエラーを表示 |
 | `?` | キー案内 |
@@ -63,7 +65,7 @@ emacs -Q --batch -l check-git.el
 emacs -Q --batch -l check-git-workflows.el
 ```
 
-`check-package.el` は一時的な package ディレクトリへインストールし、autoload と標準ライブラリだけでの起動を確認します。`check-git.el` は一時 Git リポジトリでステージ・部分操作・commit・fetch・pull・push などを検証します。`check-git-workflows.el` は履歴グラフ・ブランチ・stash を検証します。`benchmark-git.el` は既存の検証が使用するプロセス計測コードです。
+`check-package.el` は一時的な package ディレクトリへインストールし、autoload と標準ライブラリだけでの起動を確認します。`check-git.el` は一時 Git リポジトリでステージ・部分操作・commit・fetch・pull・push などを検証します。`check-git-workflows.el` は履歴グラフ・ブランチ・stash・merge・rebase・cherry-pick を検証します。`benchmark-git.el` は既存の検証が使用するプロセス計測コードです。
 
 ## ライセンス
 

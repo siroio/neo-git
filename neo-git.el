@@ -180,7 +180,8 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
                      (goto-char (point-max))
                      (insert chunk))))))))
       (condition-case failure
-          (progn
+          (let ((process-environment (cons "GIT_EDITOR=true" process-environment)))
+            ;; No terminal to edit in: continue commands keep Git's prepared message.
             (setq process
                   (make-process :name "neo-git" :buffer out :stderr err
                                 :command (cons (neo-git--executable)
@@ -1612,7 +1613,7 @@ With DISCARD, revert the selected unstaged lines/hunks in the worktree."
 (defun neo-git--mutate (arguments &optional label prefetch worktree)
   (when neo-git--mutation
     (user-error "Git operation already running"))
-  (when worktree (neo-git--worktree-ready))
+  (when worktree (neo-git--worktree-ready (eq worktree 'resume)))
   ;; A preview read started before this write must never publish against a
   ;; changed index, including when no next-file prefetch is available.
   (neo-git--invalidate-stage-prefetch)
@@ -1698,7 +1699,7 @@ With DISCARD, revert the selected unstaged lines/hunks in the worktree."
     (user-error "Select at least one file row"))
   (let* ((kinds (mapcar (lambda (entry) (plist-get entry :kind)) entries))
          (staged (memq 'staged kinds))
-         (unstaged (or (memq 'unstaged kinds) (memq 'untracked kinds)))
+         (unstaged (or (memq 'unstaged kinds) (memq 'untracked kinds) (memq 'conflict kinds)))
          (single (and (= (length entries) 1) (car entries)))
          (paths (delete-dups
                  (cl-loop for entry in entries
@@ -1714,8 +1715,13 @@ With DISCARD, revert the selected unstaged lines/hunks in the worktree."
                                   (equal (plist-get neo-git-state :oid) "(initial)")))
                         (list :path (plist-get candidate :path)
                               :kind (plist-get candidate :kind)))))
-    (when (memq 'conflict kinds)
-      (user-error "Resolve conflicts before staging"))
+    (dolist (entry entries)
+      (let ((file (expand-file-name (plist-get entry :path) neo-git-root)))
+        (when (and (eq (plist-get entry :kind) 'conflict) (file-regular-p file)
+                   (with-temp-buffer
+                     (insert-file-contents file)
+                     (re-search-forward "^\\(<<<<<<<\\|>>>>>>>\\)\\( \\|$\\)" nil t)))
+          (user-error "Conflict markers remain in %s" (plist-get entry :path)))))
     (when (and staged unstaged)
       (user-error "Select staged or unstaged rows separately"))
     (cond
@@ -1778,7 +1784,7 @@ Unstaged files are restored from the index; untracked files are deleted."
   (interactive)
   (when (seq-some (lambda (e)
                     (eq (plist-get e :kind) 'conflict)) neo-git-entries)
-    (user-error "Resolve conflicts in your Git tool before staging all files"))
+    (user-error "Stage resolved conflicts one by one before staging all files"))
   (if (seq-some (lambda (e)
                   (memq (plist-get e :kind) '(unstaged untracked))) neo-git-entries)
       (progn
@@ -1933,14 +1939,17 @@ Unstaged files are restored from the index; untracked files are deleted."
           (list selected-remote selected-branch))))))
 
 (defun neo-git--in-progress-p ()
+  "Return the Git command of the merge, rebase, cherry-pick or revert in progress."
   (let ((paths (process-lines (neo-git--executable) "-C" neo-git-root
                               "rev-parse" "--git-path" "MERGE_HEAD"
                               "--git-path" "CHERRY_PICK_HEAD"
                               "--git-path" "REVERT_HEAD"
                               "--git-path" "rebase-merge"
                               "--git-path" "rebase-apply")))
-    (seq-some (lambda (path)
-                (file-exists-p (expand-file-name path neo-git-root))) paths)))
+    (cl-loop for path in paths
+             for operation in '("merge" "cherry-pick" "revert" "rebase" "rebase")
+             when (file-exists-p (expand-file-name path neo-git-root))
+             return operation)))
 
 (defun neo-git-pull ()
   (interactive)
@@ -1975,6 +1984,7 @@ Unstaged files are restored from the index; untracked files are deleted."
     (define-key map (kbd "k") #'previous-line)
     (define-key map (kbd "SPC") #'neo-git-stash-apply)
     (define-key map (kbd "d") #'neo-git-stash-drop)
+    (define-key map (kbd "C") #'neo-git-cherry-pick)
     (define-key map (kbd "q") #'neo-git-browser-quit)
     (define-key map (kbd "TAB") #'neo-git-browser-quit)
     (define-key map (kbd "<backtab>") #'neo-git-browser-quit)
@@ -1993,7 +2003,7 @@ In stash lists, SPC: apply without deleting; d: delete with confirmation."
       (kbd "RET") #'neo-git-browser-show (kbd "r") #'neo-git-browser-refresh
       (kbd "j") #'next-line (kbd "k") #'previous-line
       (kbd "SPC") #'neo-git-stash-apply (kbd "d") #'neo-git-stash-drop
-      (kbd "TAB") #'neo-git-browser-quit (kbd "<backtab>") #'neo-git-browser-quit
+      (kbd "C") #'neo-git-cherry-pick (kbd "TAB") #'neo-git-browser-quit (kbd "<backtab>") #'neo-git-browser-quit
       (kbd "q") #'neo-git-browser-quit (kbd "<escape>") #'neo-git-browser-quit)))
 
 (defun neo-git-browser-quit ()
@@ -2008,11 +2018,12 @@ In stash lists, SPC: apply without deleting; d: delete with confirmation."
 (defun neo-git--refresh-browsers (owner &optional kind)
   "Refresh OWNER's browser buffers, only those of KIND when non-nil."
   (dolist (browser (buffer-list))
-    (with-current-buffer browser
-      (when (and (derived-mode-p 'neo-git-browser-mode)
-                 (eq neo-git--diff-owner owner)
-                 (or (null kind) (eq neo-git--browser-kind kind)))
-        (neo-git-browser-refresh)))))
+    (when (buffer-live-p browser)
+      (with-current-buffer browser
+        (when (and (derived-mode-p 'neo-git-browser-mode)
+                   (eq neo-git--diff-owner owner)
+                   (or (null kind) (eq neo-git--browser-kind kind)))
+          (neo-git-browser-refresh))))))
 
 (defun neo-git--status-owner ()
   (let ((owner (or (neo-git--owner-buffer) (current-buffer))))
@@ -2023,10 +2034,11 @@ In stash lists, SPC: apply without deleting; d: delete with confirmation."
       (user-error "Open a Neo Git status buffer first"))
     owner))
 
-(defun neo-git--worktree-ready ()
-  "Refuse worktree writes during a Git operation or unsaved file editing."
+(defun neo-git--worktree-ready (&optional resume)
+  "Refuse worktree writes during a Git operation or unsaved file editing.
+RESUME permits a merge/rebase in progress, for continuing or aborting it."
   (when neo-git--mutation (user-error "Git operation already running"))
-  (when (neo-git--in-progress-p)
+  (when (and (not resume) (neo-git--in-progress-p))
     (user-error "Finish the current merge/rebase before changing the worktree"))
   (let ((root neo-git-root))
     (dolist (buffer (buffer-list))
@@ -2037,15 +2049,17 @@ In stash lists, SPC: apply without deleting; d: delete with confirmation."
 
 (defun neo-git--revert-worktree-buffers ()
   (let ((root neo-git-root))
+    ;; Reverting runs hooks and Git, which may kill buffers in this snapshot.
     (dolist (buffer (buffer-list))
-      (with-current-buffer buffer
-        (when (and buffer-file-name (not (buffer-modified-p))
-                   (file-in-directory-p buffer-file-name root)
-                   (file-exists-p buffer-file-name))
-          (condition-case err
-              (revert-buffer t t t)
-            (error (message "Cannot reload %s: %s" buffer-file-name
-                            (error-message-string err)))))))))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (when (and buffer-file-name (not (buffer-modified-p))
+                     (file-in-directory-p buffer-file-name root)
+                     (file-exists-p buffer-file-name))
+            (condition-case err
+                (revert-buffer t t t)
+              (error (message "Cannot reload %s: %s" buffer-file-name
+                              (error-message-string err))))))))))
 
 (defun neo-git--browser-buffer (kind owner)
   "Return OWNER's browser buffer of KIND, starting its refresh."
@@ -2203,7 +2217,7 @@ One row per commit: ● commit, ○ merge, <─┐ merged branch, ─┘ fork po
                            (if tabulated-list-entries
                                (if (eq neo-git--browser-kind 'stash)
                                    " RET: diff  a: apply (keep stash)  d: delete  r: refresh  q: back"
-                                 " Latest 100 commits  RET: diff  r: refresh  q/TAB: list")
+                                 " Latest 100 commits  RET: diff  C: cherry-pick  r: refresh  q/TAB: list")
                              " No entries  r: refresh  q: back"))
                      (tabulated-list-print t))))))))))
 
@@ -2273,6 +2287,71 @@ One row per commit: ● commit, ○ merge, <─┐ merged branch, ─┘ fork po
         (user-error "Invalid branch name: %s" branch))
       (neo-git--mutate (list "switch" "-c" branch) (concat "create " branch) nil t))))
 
+;;; Merge, rebase and cherry-pick
+
+(defun neo-git--read-ref (prompt)
+  "Read a local or remote branch other than the current one."
+  (let* ((current (neo-git--current-branch))
+         (refs (cl-loop for line in (process-lines (neo-git--executable) "-C" neo-git-root
+                                                   "for-each-ref" "--format=%(refname:short)%09%(symref)"
+                                                   "refs/heads/" "refs/remotes/")
+                        for (ref symref) = (split-string line "\t")
+                        unless (or (equal ref current) (not (string-empty-p (or symref ""))))
+                        collect ref)))
+    (unless refs (user-error "No other branch"))
+    (completing-read prompt refs nil t)))
+
+(defun neo-git-merge ()
+  "Merge a branch into HEAD.
+While a merge, rebase or cherry-pick is in progress, continue or abort it."
+  (interactive)
+  (with-current-buffer (neo-git--status-owner)
+    (if (neo-git--in-progress-p)
+        (neo-git-continue)
+      (neo-git--worktree-ready)
+      (let ((ref (neo-git--read-ref "Merge branch: ")))
+        (neo-git--mutate (list "merge" "--no-edit" ref) (concat "merge " ref) nil t)))))
+
+(defun neo-git-rebase ()
+  "Rebase the current branch onto another branch."
+  (interactive)
+  (with-current-buffer (neo-git--status-owner)
+    (neo-git--worktree-ready)
+    (let ((ref (neo-git--read-ref "Rebase onto: ")))
+      (neo-git--mutate (list "rebase" ref) (concat "rebase " ref) nil t))))
+
+(defun neo-git-cherry-pick ()
+  "Apply the selected history commit onto HEAD."
+  (interactive)
+  (unless (eq neo-git--browser-kind 'history) (user-error "Open the history first"))
+  (let ((oid (or (tabulated-list-get-id) (user-error "Select a commit"))))
+    (with-current-buffer (neo-git--status-owner)
+      (neo-git--worktree-ready)
+      (when (y-or-n-p (format "Cherry-pick %s onto HEAD? " (substring oid 0 8)))
+        (neo-git--mutate (list "cherry-pick" oid)
+                         (concat "cherry-pick " (substring oid 0 8)) nil t)))))
+
+(defun neo-git-continue ()
+  "Continue, skip or abort the merge, rebase or cherry-pick in progress.
+Resolve conflicts and stage the files before continuing."
+  (interactive)
+  (with-current-buffer (neo-git--status-owner)
+    (let* ((operation (or (neo-git--in-progress-p)
+                          (user-error "No merge, rebase or cherry-pick in progress")))
+           (skip (not (equal operation "merge")))
+           (choice (read-char-choice
+                    (format "%s: [c] continue  [a] abort%s  [q] cancel "
+                            operation (if skip "  [s] skip" ""))
+                    (if skip '(?c ?a ?s ?q) '(?c ?a ?q))))
+           (action (pcase choice (?c "--continue") (?s "--skip") (?a "--abort"))))
+      (when (and (equal action "--abort")
+                 (not (yes-or-no-p (format "Abort the %s and restore the previous state? "
+                                           operation))))
+        (setq action nil))
+      (when action
+        (neo-git--mutate (list operation action)
+                         (format "%s %s" operation (substring action 2)) nil 'resume)))))
+
 (defun neo-git-stash-save ()
   "Save changes, optionally including untracked files."
   (interactive)
@@ -2320,7 +2399,8 @@ One row per commit: ● commit, ○ merge, <─┐ merged branch, ─┘ fork po
   (dolist (binding '(("l" . neo-git-history) ("b" . neo-git-switch-branch)
                      ("B" . neo-git-create-branch) ("s" . neo-git-stash-save)
                      ("S" . neo-git-stash) ("3" . neo-git-switch-branch)
-                     ("4" . neo-git-history) ("5" . neo-git-stash-list)))
+                     ("4" . neo-git-history) ("5" . neo-git-stash-list)
+                     ("m" . neo-git-merge) ("M" . neo-git-rebase) ("A" . neo-git-continue)))
     (define-key map (kbd (car binding)) (cdr binding))))
 (with-eval-after-load 'evil
   (dolist (map (list neo-git-mode-map neo-git-diff-mode-map))
@@ -2328,7 +2408,8 @@ One row per commit: ● commit, ○ merge, <─┐ merged branch, ─┘ fork po
       (kbd "l") #'neo-git-history (kbd "b") #'neo-git-switch-branch
       (kbd "B") #'neo-git-create-branch (kbd "s") #'neo-git-stash-save
       (kbd "S") #'neo-git-stash (kbd "3") #'neo-git-switch-branch
-      (kbd "4") #'neo-git-history (kbd "5") #'neo-git-stash-list)))
+      (kbd "4") #'neo-git-history (kbd "5") #'neo-git-stash-list
+      (kbd "m") #'neo-git-merge (kbd "M") #'neo-git-rebase (kbd "A") #'neo-git-continue)))
 
 (provide 'neo-git)
 ;;; neo-git.el ends here
