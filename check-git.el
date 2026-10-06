@@ -44,14 +44,15 @@
   (let ((coding-system-for-write 'no-conversion))
     (write-region (encode-coding-string text 'utf-8-unix) nil file nil 'silent)))
 
-(defun neo-git-check-apply-patch (root patch reverse)
+(defun neo-git-check-apply-patch (root patch reverse &optional worktree)
   (let ((file (make-temp-file "neo-git-check-patch-"))
         (coding-system-for-write 'utf-8-unix))
     (unwind-protect
         (progn
           (write-region patch nil file nil 'silent)
           (apply #'neo-git-check-call
-                 (append (list "-C" root "apply" "--cached" "--whitespace=nowarn")
+                 (append (list "-C" root "apply" "--whitespace=nowarn")
+                         (unless worktree (list "--cached"))
                          (when reverse (list "--reverse"))
                          (list file))))
       (when (file-exists-p file)
@@ -729,7 +730,20 @@
                                  (let ((line (line-number-at-pos))) (cons line line)))
                'line 'unstage)
             (user-error (setq rejected t)))
-          (cl-assert rejected nil "Partial unstage of a deleted file must be rejected")))
+          (cl-assert rejected nil "Partial unstage of a deleted file must be rejected"))
+        ;; Discard reverts only the selected unstaged hunk in the worktree.
+        (let ((before-index (neo-git-check-bytes "-C" root "show" (concat ":" path)))
+              (expected (copy-sequence working-lines)))
+          (neo-git-check-apply-patch
+           root (neo-git-check-partial-patch root path 'unstaged "+新しい middle" 'unstage 'hunk) t t)
+          (setf (nth 11 expected) "old-middle")
+          (cl-assert (equal (neo-git-check-file-bytes file)
+                            (encode-coding-string
+                             (mapconcat #'identity expected "\r\n") 'utf-8-unix))
+                     nil "Discard must revert only the selected worktree hunk")
+          (cl-assert (equal before-index
+                            (neo-git-check-bytes "-C" root "show" (concat ":" path)))
+                     nil "Discard must not alter the index")))
     (delete-directory root t))))
 
 (neo-git-benchmark-stop)

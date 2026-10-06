@@ -301,6 +301,7 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
     (define-key map (kbd "j") #'neo-git-next)
     (define-key map (kbd "k") #'neo-git-previous)
     (define-key map (kbd "SPC") #'neo-git-stage-toggle)
+    (define-key map (kbd "d") #'neo-git-discard)
     (define-key map (kbd "v") #'neo-git-visual-mark)
     (define-key map (kbd "V") #'neo-git-visual-line)
     (define-key map (kbd "a") #'neo-git-stage-all-toggle)
@@ -313,8 +314,8 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
     (define-key map (kbd "R") #'neo-git-refresh)
     (define-key map (kbd "/") #'neo-git-search)
     (define-key map (kbd "f") #'neo-git-fetch)
-    (define-key map (kbd "F") #'neo-git-pull)
-    (define-key map (kbd "p") #'neo-git-push)
+    (define-key map (kbd "p") #'neo-git-pull)
+    (define-key map (kbd "P") #'neo-git-push)
     (define-key map (kbd "@") #'neo-git-open-log)
     (define-key map (kbd "?") #'describe-mode)
     (define-key map (kbd "q") #'neo-git-quit)
@@ -333,13 +334,13 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
   (hl-line-mode 1)
   (when (fboundp 'evil-define-key*)
     (evil-define-key* '(normal motion) neo-git-mode-map
-                      (kbd "SPC") #'neo-git-stage-toggle
+                      (kbd "SPC") #'neo-git-stage-toggle (kbd "d") #'neo-git-discard
                       (kbd "v") #'evil-visual-char (kbd "V") #'evil-visual-line
                       (kbd "j") #'neo-git-next (kbd "k") #'neo-git-previous
                       (kbd "a") #'neo-git-stage-all-toggle (kbd "c") #'neo-git-commit
                       (kbd "e") #'neo-git-visit-file (kbd "r") #'neo-git-refresh
                       (kbd "R") #'neo-git-refresh (kbd "f") #'neo-git-fetch
-                      (kbd "F") #'neo-git-pull (kbd "p") #'neo-git-push
+                      (kbd "p") #'neo-git-pull (kbd "P") #'neo-git-push
                       (kbd "@") #'neo-git-open-log
                       (kbd "RET") #'neo-git-focus-diff (kbd "TAB") #'neo-git-focus-diff
                       (kbd "<backtab>") #'neo-git-focus-list (kbd "<escape>") #'neo-git-focus-list
@@ -354,6 +355,7 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
     (define-key map (kbd "<backtab>") #'neo-git-focus-list)
     (define-key map (kbd ",") 'neo-leader-map)
     (define-key map (kbd "SPC") #'neo-git--owner-stage)
+    (define-key map (kbd "d") #'neo-git-discard)
     (define-key map (kbd "j") #'neo-git-diff-next-line)
     (define-key map (kbd "k") #'neo-git-diff-previous-line)
     (define-key map (kbd "J") #'neo-git--owner-next)
@@ -367,21 +369,21 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
     (define-key map (kbd "r") #'neo-git--owner-refresh)
     (define-key map (kbd "R") #'neo-git--owner-refresh)
     (define-key map (kbd "f") #'neo-git--owner-fetch)
-    (define-key map (kbd "F") #'neo-git--owner-pull)
-    (define-key map (kbd "p") #'neo-git--owner-push)
+    (define-key map (kbd "p") #'neo-git--owner-pull)
+    (define-key map (kbd "P") #'neo-git--owner-push)
     (define-key map (kbd "q") #'neo-git-focus-list)
     map))
 
 (with-eval-after-load 'evil
   (evil-define-key* '(normal motion) neo-git-diff-mode-map
-                    (kbd "SPC") #'neo-git--owner-stage
+                    (kbd "SPC") #'neo-git--owner-stage (kbd "d") #'neo-git-discard
                     (kbd "j") #'neo-git-diff-next-line (kbd "k") #'neo-git-diff-previous-line
                     (kbd "J") #'neo-git--owner-next (kbd "K") #'neo-git--owner-previous
                     (kbd "v") #'evil-visual-char (kbd "V") #'evil-visual-line
                     (kbd "a") #'neo-git--owner-toggle-partial-mode (kbd "c") #'neo-git--owner-commit
                     (kbd "e") #'neo-git-diff-visit-line (kbd "r") #'neo-git--owner-refresh
                     (kbd "R") #'neo-git--owner-refresh (kbd "f") #'neo-git--owner-fetch
-                    (kbd "F") #'neo-git--owner-pull (kbd "p") #'neo-git--owner-push
+                    (kbd "p") #'neo-git--owner-pull (kbd "P") #'neo-git--owner-push
                     (kbd "@") #'neo-git-open-log
                     (kbd "q") #'neo-git-focus-list (kbd "<escape>") #'neo-git-diff-escape
                     (kbd "TAB") #'neo-git-focus-list (kbd "<backtab>") #'neo-git-focus-list
@@ -393,9 +395,9 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
 
 (with-eval-after-load 'evil
   (evil-define-key* '(visual) neo-git-mode-map
-                    (kbd "SPC") #'neo-git-stage-toggle)
+                    (kbd "SPC") #'neo-git-stage-toggle (kbd "d") #'neo-git-discard)
   (evil-define-key* '(visual) neo-git-diff-mode-map
-                    (kbd "SPC") #'neo-git--owner-stage))
+                    (kbd "SPC") #'neo-git--owner-stage (kbd "d") #'neo-git-discard))
 
 ;;; Selection and pane command routing
 
@@ -1366,13 +1368,14 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
                   (format "Git exited with status %s" status)
                 (string-trim error-output)))
         (unless neo-git--closed
-          (message "Neo Git partial stage failed: %s" neo-git--last-error)
+          (message "Neo Git partial operation failed: %s" neo-git--last-error)
           (neo-git--render))
         (when (and refresh (not neo-git--closed))
           (neo-git-refresh))))))
 
-(defun neo-git--partial-stage-toggle ()
-  "Stage or unstage selected diff lines/hunks without touching the worktree."
+(defun neo-git--partial-stage-toggle (&optional discard)
+  "Stage or unstage selected diff lines/hunks without touching the worktree.
+With DISCARD, revert the selected unstaged lines/hunks in the worktree."
   (interactive)
   (unless (derived-mode-p 'diff-mode)
     (user-error "Open a Neo Git diff first"))
@@ -1397,8 +1400,11 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
                           (eq (plist-get candidate :kind) (cadr id))))
                    (buffer-local-value 'neo-git-entries owner)))
            (kind (cadr id))
-           (operation (if (eq kind 'staged) 'unstage 'stage)))
+           ;; Discard reverse-applies the unstage-shaped patch to the worktree.
+           (operation (if (or discard (eq kind 'staged)) 'unstage 'stage)))
       (unless entry (user-error "The selected file is no longer in status"))
+      (when (and discard (not (eq kind 'unstaged)))
+        (user-error "Only unstaged lines can be discarded; unstage them first"))
       (when (plist-get entry :old-path)
         (user-error "Partial staging is unavailable for renamed files"))
       (when (eq kind 'untracked)
@@ -1412,12 +1418,18 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
              (token (make-symbol "neo-git-partial"))
              (root (buffer-local-value 'neo-git-root owner))
              (refresh-generation (buffer-local-value 'neo-git--refresh-generation owner)))
+        (when discard
+          (with-current-buffer owner (neo-git--worktree-ready))
+          (unless (yes-or-no-p (format "Discard selected %s changes in %s? "
+                                       mode (neo-git--display-path (car id))))
+            (user-error "Discard cancelled")))
         (with-current-buffer owner
           (setq neo-git--partial-operation token
                 neo-git--mutation t
                 neo-git--mutation-label
                 (format "%s %s: %s"
-                        (if (eq operation 'stage) "Stage" "Unstage") mode
+                        (cond (discard "Discard") ((eq operation 'stage) "Stage") (t "Unstage"))
+                        mode
                         (neo-git--display-path (car id))))
           (neo-git--progress-begin)
           (neo-git--render))
@@ -1463,9 +1475,13 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
                      (t
                       (let ((apply-process
                              (neo-git--run
-                              root (append '("apply" "--cached" "--whitespace=nowarn")
+                              root (append '("apply" "--whitespace=nowarn")
+                                           (unless discard '("--cached"))
                                            (when (eq operation 'unstage) '("--reverse")))
                               (lambda (apply-status _output apply-error)
+                                (when (and discard (eq apply-status 0) (buffer-live-p owner))
+                                  (with-current-buffer owner
+                                    (neo-git--revert-worktree-buffers)))
                                 (neo-git--partial-finish
                                  owner token apply-status apply-error))
                               neo-git--limit patch)))
@@ -1724,6 +1740,37 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
       (setq mark-active nil))
     (setq neo-git--visual-inclusive nil)))
 
+(defun neo-git-discard ()
+  "Discard selected worktree changes: lines/hunks in a diff, files in the list.
+Unstaged files are restored from the index; untracked files are deleted."
+  (interactive)
+  (if (derived-mode-p 'diff-mode)
+      (neo-git--partial-stage-toggle 'discard)
+    (let* ((entries (or (neo-git--selected-entries)
+                        (user-error "Select at least one file row")))
+           (kinds (delete-dups (mapcar (lambda (entry) (plist-get entry :kind)) entries)))
+           (paths (mapcar (lambda (entry) (concat ":(literal)" (plist-get entry :path)))
+                          entries)))
+      (unless (= (length kinds) 1)
+        (user-error "Select unstaged or untracked rows separately"))
+      (unless (memq (car kinds) '(unstaged untracked))
+        (user-error "Only unstaged or untracked changes can be discarded"))
+      (neo-git--worktree-ready)
+      (unless (yes-or-no-p (format "%s? This cannot be undone. "
+                                   (neo-git--stage-label
+                                    (if (eq (car kinds) 'untracked) "Delete" "Discard")
+                                    entries)))
+        (user-error "Discard cancelled"))
+      (neo-git--mutate (append (if (eq (car kinds) 'untracked)
+                                   '("clean" "-f" "--")
+                                 '("restore" "--worktree" "--"))
+                               paths)
+                       (neo-git--stage-label "Discard" entries) nil t)
+      (if (and (fboundp 'evil-visual-state-p) (evil-visual-state-p))
+          (evil-normal-state)
+        (setq mark-active nil))
+      (setq neo-git--visual-inclusive nil))))
+
 (defun neo-git-stage-all-toggle ()
   (interactive)
   (when (seq-some (lambda (e)
@@ -1909,7 +1956,7 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
     (define-key map (kbd "r") #'neo-git-browser-refresh)
     (define-key map (kbd "j") #'next-line)
     (define-key map (kbd "k") #'previous-line)
-    (define-key map (kbd "a") #'neo-git-stash-apply)
+    (define-key map (kbd "SPC") #'neo-git-stash-apply)
     (define-key map (kbd "d") #'neo-git-stash-drop)
     (define-key map (kbd "q") #'neo-git-browser-quit)
     (define-key map (kbd "TAB") #'neo-git-browser-quit)
@@ -1922,13 +1969,13 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
 
 (define-derived-mode neo-git-browser-mode tabulated-list-mode "Neo-Git-Browse"
   "Browse commits or stash entries. RET: diff; r: refresh; q: return.
-In stash lists, a: apply without deleting; d: delete with confirmation."
+In stash lists, SPC: apply without deleting; d: delete with confirmation."
   (setq-local truncate-lines t)
   (when (fboundp 'evil-define-key*)
     (evil-define-key* '(normal motion) neo-git-browser-mode-map
       (kbd "RET") #'neo-git-browser-show (kbd "r") #'neo-git-browser-refresh
       (kbd "j") #'next-line (kbd "k") #'previous-line
-      (kbd "a") #'neo-git-stash-apply (kbd "d") #'neo-git-stash-drop
+      (kbd "SPC") #'neo-git-stash-apply (kbd "d") #'neo-git-stash-drop
       (kbd "TAB") #'neo-git-browser-quit (kbd "<backtab>") #'neo-git-browser-quit
       (kbd "q") #'neo-git-browser-quit (kbd "<escape>") #'neo-git-browser-quit)))
 
@@ -2254,13 +2301,17 @@ One row per commit: ● commit, ○ merge, <─┐ merged branch, ─┘ fork po
 
 (dolist (map (list neo-git-mode-map neo-git-diff-mode-map))
   (dolist (binding '(("l" . neo-git-history) ("b" . neo-git-switch-branch)
-                     ("B" . neo-git-create-branch) ("z" . neo-git-stash)))
+                     ("B" . neo-git-create-branch) ("s" . neo-git-stash-save)
+                     ("S" . neo-git-stash) ("3" . neo-git-switch-branch)
+                     ("4" . neo-git-history) ("5" . neo-git-stash-list)))
     (define-key map (kbd (car binding)) (cdr binding))))
 (with-eval-after-load 'evil
   (dolist (map (list neo-git-mode-map neo-git-diff-mode-map))
     (evil-define-key* '(normal motion) map
       (kbd "l") #'neo-git-history (kbd "b") #'neo-git-switch-branch
-      (kbd "B") #'neo-git-create-branch (kbd "z") #'neo-git-stash)))
+      (kbd "B") #'neo-git-create-branch (kbd "s") #'neo-git-stash-save
+      (kbd "S") #'neo-git-stash (kbd "3") #'neo-git-switch-branch
+      (kbd "4") #'neo-git-history (kbd "5") #'neo-git-stash-list)))
 
 (provide 'neo-git)
 ;;; neo-git.el ends here
