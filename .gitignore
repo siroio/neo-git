@@ -3,3 +3,29 @@
 *~
 \#*\#
 .\#*
+
+# Local runtime state, build products and diagnostic output
+/var/
+/eln-cache/
+*.o
+*.obj
+*.exe
+*.tar
+*.zip
+*.log
+*.stdout
+*.stderr
+*.tmp
+emacs_backtrace.txt
+__pycache__/
+*.pyc
+
+# Local editor/OS settings and environment secrets
+/.vscode/
+/.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+.env
+.env.*
+!.env.example
