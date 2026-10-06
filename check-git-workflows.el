@@ -51,11 +51,13 @@
         (with-current-buffer history
           (goto-char (point-min))
           (cl-assert (string-match-p "initial 日本語" (buffer-string)))
-          ;; Merge graph: commit rows carry ids, connector rows (|\, |/) do not.
-          (cl-assert (string-match-p "^ *\\*.*(HEAD -> main) merge side" (buffer-string)))
-          (cl-assert (string-match-p "^ *|\\\\" (buffer-string)))
-          (cl-assert (seq-some (lambda (entry) (null (car entry))) tabulated-list-entries))
-          (cl-assert (= 3 (seq-count #'car tabulated-list-entries)))
+          ;; One row per commit: a hollow merge node pulls in the side lane,
+          ;; which forks off the initial commit.
+          (cl-assert (string-match-p "^ *○<┐.*(HEAD -> main) merge side" (buffer-string)))
+          (cl-assert (string-match-p "^ *│ ●.*side work" (buffer-string)))
+          (cl-assert (string-match-p "^ *●─┘.*initial" (buffer-string)))
+          (cl-assert (= 3 (length tabulated-list-entries)))
+          (cl-assert (seq-every-p #'car tabulated-list-entries))
           (goto-char (point-max))
           (forward-line -1)
           (cl-letf (((symbol-function 'pop-to-buffer) #'set-buffer))

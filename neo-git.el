@@ -1916,9 +1916,6 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
     (define-key map (kbd "<backtab>") #'neo-git-browser-quit)
     map))
 
-(defface neo-git-graph-face '((t (:inherit font-lock-keyword-face)))
-  "Face for the commit graph in Neo Git history."
-  :group 'neo-git)
 (defface neo-git-ref-face '((t (:inherit font-lock-constant-face :weight bold)))
   "Face for branch and tag names in Neo Git history."
   :group 'neo-git)
@@ -2014,30 +2011,84 @@ In stash lists, a: apply without deleting; d: delete with confirmation."
                (select-window window))
       (pop-to-buffer buffer))))
 
+(defconst neo-git--graph-colors
+  '("#6fbfae" "#e5c07b" "#a9c27a" "#e06c75" "#d78fbf" "#61afef")
+  "Lane colors for the history graph, cycled as branch lanes appear.")
+
+(defun neo-git--graph-string (cells)
+  "Join CELLS of (CHAR . COLOR) or nil into a colored graph string."
+  (string-trim-right
+   (mapconcat (lambda (cell)
+                (if cell (propertize (string (car cell)) 'face (list :foreground (cdr cell)))
+                  " "))
+              cells "")))
+
 (defun neo-git--history-entries (output)
-  "Parse `git log --graph' OUTPUT into tabulated entries.
-Graph-only connector rows such as \"|\\\" have no commit id."
-  (let ((rows
-         (mapcar
-          (lambda (line)
-            (let* ((separator (string-search "\x1f" line))
-                   (graph (propertize (string-trim-right (substring line 0 separator))
-                                      'face 'neo-git-graph-face))
-                   (fields (and separator
-                                (split-string (substring line (1+ separator)) "\x1f"))))
-              (if (null fields)
-                  (list nil (vector graph "" "" ""))
-                (list (nth 0 fields)
-                      (vector graph
-                              (propertize (nth 1 fields) 'face 'font-lock-comment-face)
-                              (nth 2 fields)
-                              (concat (unless (string-empty-p (nth 3 fields))
-                                        (propertize (format "(%s) " (nth 3 fields))
-                                                    'face 'neo-git-ref-face))
-                                      (string-join (nthcdr 4 fields) " ")))))))
-          (split-string output "\n" t))))
+  "Parse `git log' OUTPUT of id, parents and columns into graph entries.
+One row per commit: ● commit, ○ merge, <─┐ merged branch, ─┘ fork point."
+  (let (lanes (next 0) rows)
+    (cl-labels ((alloc (oid)
+                  (let ((i (or (cl-position nil lanes)
+                               (progn (setq lanes (nconc lanes (list nil)))
+                                      (1- (length lanes))))))
+                    (setf (nth i lanes)
+                          (cons oid (nth (mod next (length neo-git--graph-colors))
+                                         neo-git--graph-colors)))
+                    (cl-incf next)
+                    i))
+                (lane (oid) (cl-position oid lanes :key #'car-safe :test #'equal)))
+      (dolist (line (split-string output "
+" t))
+        (pcase-let* ((`(,oid ,parents ,hash ,date ,refs . ,subject) (split-string line ""))
+                     (parents (split-string parents " " t))
+                     (above (copy-sequence lanes))
+                     (col (or (lane oid) (alloc oid)))
+                     (color (cdr (nth col lanes)))
+                     (closing nil) (links nil))
+          ;; Other lanes waiting for this commit branched off here.
+          (dotimes (k (length lanes))
+            (when (and (/= k col) (equal (car-safe (nth k lanes)) oid))
+              (push (cons k (cdr (nth k lanes))) closing)
+              (setf (nth k lanes) nil)))
+          (setf (nth col lanes) (and parents (cons (car parents) color)))
+          (dolist (parent (cdr parents))
+            (let* ((j (lane parent))
+                   (corner (if j (if (> j col) ?┤ ?├) (setq j (alloc parent)) (if (> j col) ?┐ ?┌))))
+              (push (list j (cdr (nth j lanes)) corner) links)))
+          (let ((cells (make-vector (* 2 (length lanes)) nil)))
+            (cl-flet ((line-to (j color corner arrow)
+                        (let ((from (if (> j col) (1+ (* 2 col)) (1+ (* 2 j))))
+                              (to (if (> j col) (1- (* 2 j)) (1- (* 2 col)))))
+                          (cl-loop for i from from to to
+                                   unless (aref cells i) do (aset cells i (cons ?─ color)))
+                          (aset cells (* 2 j) (cons corner color))
+                          (when arrow
+                            (aset cells (if (> j col) (1+ (* 2 col)) (1- (* 2 col)))
+                                  (cons (if (> j col) ?< ?>) color))))))
+              (dotimes (k (length lanes))
+                (when (and (/= k col) (nth k lanes) (nth k above))
+                  (aset cells (* 2 k) (cons ?│ (cdr (nth k lanes))))))
+              (dolist (link links) (line-to (nth 0 link) (nth 1 link) (nth 2 link) t))
+              (dolist (close closing)
+                ;; A merged branch may reuse the lane ending here: ┐+┘ → ┤.
+                (line-to (car close) (cdr close)
+                         (pcase (car (aref cells (* 2 (car close))))
+                           (?┐ ?┤) (?┌ ?├) (_ (if (> (car close) col) ?┘ ?└)))
+                         nil))
+              (aset cells (* 2 col) (cons (if (cdr parents) ?○ ?●) color)))
+            (push (list oid
+                        (vector (neo-git--graph-string cells)
+                                (propertize hash 'face 'font-lock-comment-face)
+                                date
+                                (concat (unless (string-empty-p refs)
+                                          (propertize (format "(%s) " refs) 'face 'neo-git-ref-face))
+                                        (string-join subject " "))))
+                  rows))
+          (while (and lanes (null (car (last lanes))))
+            (setq lanes (butlast lanes))))))
+    (setq rows (nreverse rows))
     (setf (cadr (aref tabulated-list-format 0))
-          (apply #'max 1 (mapcar (lambda (row) (length (aref (cadr row) 0))) rows)))
+          (apply #'max 1 (mapcar (lambda (row) (string-width (aref (cadr row) 0))) rows)))
     rows))
 
 (defun neo-git-history ()
@@ -2061,8 +2112,8 @@ Graph-only connector rows such as \"|\\\" have no commit id."
           (neo-git--run
            neo-git-root
            (if (eq neo-git--browser-kind 'history)
-               '("log" "--graph" "-100" "--date=short" "--color=never"
-                 "--format=%x1f%H%x1f%h%x1f%ad%x1f%D%x1f%s")
+               '("log" "--topo-order" "-100" "--date=short" "--color=never"
+                 "--format=%H%x1f%P%x1f%h%x1f%ad%x1f%D%x1f%s")
              '("stash" "list" "--format=%H%x09%gd%x09%gs"))
            (lambda (status output errors)
              (when (buffer-live-p buffer)
