@@ -207,6 +207,80 @@
           (neo-git-workflow-wait (lambda () (not neo-git--mutation))))
         (neo-git-workflow-output root "merge-base" "--is-ancestor" "main" "HEAD")
         (neo-git-workflow-output root "switch" "-q" "main")
+        ;; History can include commits of every branch.
+        (with-current-buffer history
+          (cl-assert (not (string-match-p "pick me" (buffer-string))))
+          (neo-git-history-toggle-all)
+          (neo-git-workflow-wait (lambda () (string-match-p "pick me" (buffer-string))))
+          (neo-git-history-toggle-all)
+          (neo-git-workflow-wait (lambda () (not (string-match-p "pick me" (buffer-string))))))
+        ;; Branch list: current marker, remote rows, rename, delete and creation from a row.
+        (neo-git-workflow-output root "remote" "add" "origin" root)
+        (neo-git-workflow-output root "fetch" "-q" "origin")
+        (neo-git-workflow-output root "branch" "-qD" "pick")
+        (let (branches)
+          (with-current-buffer owner
+            (cl-letf (((symbol-function 'pop-to-buffer) #'set-buffer)) (neo-git-branch-list))
+            (setq branches (current-buffer)))
+          (neo-git-workflow-wait (lambda () (with-current-buffer branches tabulated-list-entries)))
+          (with-current-buffer branches
+            (cl-assert (equal "*" (aref (cadr (assoc "refs/heads/main" tabulated-list-entries)) 0)))
+            (cl-assert (assoc "refs/remotes/origin/pick" tabulated-list-entries))
+            (cl-assert (not (assoc "refs/remotes/origin/HEAD" tabulated-list-entries)))
+            ;; A remote row becomes a local tracking branch.
+            (cl-letf (((symbol-function 'tabulated-list-get-id)
+                       (lambda (&rest _) "refs/remotes/origin/pick")))
+              (neo-git-browser-select)))
+          (neo-git-workflow-wait (lambda () (not (buffer-local-value 'neo-git--mutation owner))))
+          (cl-assert (equal "pick" (neo-git-workflow-output root "branch" "--show-current")))
+          (cl-assert (equal "origin/pick" (neo-git-workflow-output
+                                           root "rev-parse" "--abbrev-ref" "pick@{upstream}")))
+          (neo-git-workflow-wait
+           (lambda () (with-current-buffer branches
+                        (and (not neo-git--browser-process)
+                             (equal "*" (aref (cadr (assoc "refs/heads/pick" tabulated-list-entries))
+                                              0))))))
+          ;; New branch from a history row, then rename it.
+          (let ((start (neo-git-workflow-output root "rev-parse" "main~1")))
+            (with-current-buffer history
+              (cl-letf (((symbol-function 'tabulated-list-get-id) (lambda (&rest _) start))
+                        ((symbol-function 'read-string) (lambda (&rest _) "from-commit")))
+                (neo-git-browser-create-branch)))
+            (neo-git-workflow-wait (lambda () (not (buffer-local-value 'neo-git--mutation owner))))
+            (cl-assert (equal "from-commit" (neo-git-workflow-output root "branch" "--show-current")))
+            (cl-assert (equal start (neo-git-workflow-output root "rev-parse" "HEAD"))))
+          (with-current-buffer branches
+            (cl-letf (((symbol-function 'tabulated-list-get-id)
+                       (lambda (&rest _) "refs/heads/from-commit"))
+                      ((symbol-function 'read-string) (lambda (&rest _) "renamed")))
+              (neo-git-branch-rename)))
+          (neo-git-workflow-wait (lambda () (not (buffer-local-value 'neo-git--mutation owner))))
+          (cl-assert (equal "renamed" (neo-git-workflow-output root "branch" "--show-current")))
+          (neo-git-workflow-output root "switch" "-q" "main")
+          ;; Merged branches delete with d; unmerged ones need D.
+          (with-current-buffer branches
+            (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) t))
+                      ((symbol-function 'tabulated-list-get-id) (lambda (&rest _) "refs/heads/renamed")))
+              (neo-git-browser-delete))
+            (neo-git-workflow-wait (lambda () (not (buffer-local-value 'neo-git--mutation owner))))
+            (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) t))
+                      ((symbol-function 'tabulated-list-get-id) (lambda (&rest _) "refs/heads/topic")))
+              (neo-git-browser-delete)
+              (neo-git-workflow-wait (lambda () (not (buffer-local-value 'neo-git--mutation owner))))
+              (cl-assert (buffer-local-value 'neo-git--last-error owner))
+              (neo-git-branch-force-delete))
+            (neo-git-workflow-wait (lambda () (not (buffer-local-value 'neo-git--mutation owner))))
+            (let (rejected)
+              (cl-letf (((symbol-function 'tabulated-list-get-id)
+                         (lambda (&rest _) "refs/remotes/origin/main")))
+                (condition-case nil (neo-git-browser-delete) (user-error (setq rejected t))))
+              (cl-assert rejected)))
+          (cl-assert (string-empty-p (neo-git-workflow-output root "branch" "--list" "renamed" "topic")))
+          (neo-git-workflow-wait
+           (lambda () (with-current-buffer branches
+                        (and (not neo-git--browser-process)
+                             (not (assoc "refs/heads/topic" tabulated-list-entries))))))
+          (kill-buffer branches))
         (princ "NEO_GIT_WORKFLOWS=PASS\n"))
     (dolist (buffer (list file-buffer history stash preview owner))
       (when (buffer-live-p buffer)

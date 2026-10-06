@@ -1635,7 +1635,8 @@ With DISCARD, revert the selected unstaged lines/hunks in the worktree."
                                      neo-git--mutation-label nil)
                                (neo-git--progress-stop)
                                (when worktree (neo-git--revert-worktree-buffers))
-                               (when (or worktree (equal (car arguments) "stash"))
+                               (when (or worktree (member (car arguments)
+                                                          '("stash" "branch" "fetch" "pull" "push")))
                                  (neo-git--refresh-browsers buffer))
                                (unless neo-git--closed
                                  (if (and (integerp status) (zerop status))
@@ -1971,7 +1972,14 @@ Unstaged files are restored from the index; untracked files are deleted."
 
 ;;; History, branches and stash
 
+(defconst neo-git--branch-format
+  '("--format=%(refname)%09%(refname:short)%09%(symref)%09%(HEAD)%09%(upstream:short)%09%(upstream:track)%09%(committerdate:short)%09%(subject)"
+    "refs/heads/" "refs/remotes/")
+  "`for-each-ref' arguments listing local, then remote branches.")
+
 (defvar-local neo-git--browser-kind nil)
+(defvar-local neo-git--history-all nil
+  "Non-nil when the history pane shows all branches, remotes and tags.")
 (defvar-local neo-git--browser-process nil)
 (defvar-local neo-git--browser-generation 0)
 
@@ -1982,8 +1990,12 @@ Unstaged files are restored from the index; untracked files are deleted."
     (define-key map (kbd "r") #'neo-git-browser-refresh)
     (define-key map (kbd "j") #'next-line)
     (define-key map (kbd "k") #'previous-line)
-    (define-key map (kbd "SPC") #'neo-git-stash-apply)
-    (define-key map (kbd "d") #'neo-git-stash-drop)
+    (define-key map (kbd "SPC") #'neo-git-browser-select)
+    (define-key map (kbd "d") #'neo-git-browser-delete)
+    (define-key map (kbd "D") #'neo-git-branch-force-delete)
+    (define-key map (kbd "R") #'neo-git-branch-rename)
+    (define-key map (kbd "B") #'neo-git-browser-create-branch)
+    (define-key map (kbd "a") #'neo-git-history-toggle-all)
     (define-key map (kbd "C") #'neo-git-cherry-pick)
     (define-key map (kbd "q") #'neo-git-browser-quit)
     (define-key map (kbd "TAB") #'neo-git-browser-quit)
@@ -1995,14 +2007,19 @@ Unstaged files are restored from the index; untracked files are deleted."
   :group 'neo-git)
 
 (define-derived-mode neo-git-browser-mode tabulated-list-mode "Neo-Git-Browse"
-  "Browse commits or stash entries. RET: diff; r: refresh; q: return.
+  "Browse commits, branches or stash entries. RET: diff; r: refresh; q: return.
+In history, a: toggle all branches; B: branch here; C: cherry-pick.
+In branch lists, SPC: switch (remote: tracking branch); B: branch from it;
+R: rename; d/D: delete/force delete.
 In stash lists, SPC: apply without deleting; d: delete with confirmation."
   (setq-local truncate-lines t)
   (when (fboundp 'evil-define-key*)
     (evil-define-key* '(normal motion) neo-git-browser-mode-map
       (kbd "RET") #'neo-git-browser-show (kbd "r") #'neo-git-browser-refresh
       (kbd "j") #'next-line (kbd "k") #'previous-line
-      (kbd "SPC") #'neo-git-stash-apply (kbd "d") #'neo-git-stash-drop
+      (kbd "SPC") #'neo-git-browser-select (kbd "d") #'neo-git-browser-delete
+      (kbd "D") #'neo-git-branch-force-delete (kbd "R") #'neo-git-branch-rename
+      (kbd "B") #'neo-git-browser-create-branch (kbd "a") #'neo-git-history-toggle-all
       (kbd "C") #'neo-git-cherry-pick (kbd "TAB") #'neo-git-browser-quit (kbd "<backtab>") #'neo-git-browser-quit
       (kbd "q") #'neo-git-browser-quit (kbd "<escape>") #'neo-git-browser-quit)))
 
@@ -2070,11 +2087,13 @@ RESUME permits a merge/rebase in progress, for continuing or aborting it."
       (setq neo-git-root root default-directory root
             neo-git--diff-owner owner neo-git--browser-kind kind
             tabulated-list-format
-            (if (eq kind 'history)
-                ;; Unsortable: sorting would scramble the graph.
-                (vector (list "Graph" 1 nil) (list "Commit" 8 nil)
-                        (list "Date" 11 nil) (list "Subject" 0 nil))
-              [("Stash" 16 t) ("Subject" 0 t)]))
+            (pcase kind
+              ;; Unsortable: sorting would scramble the graph.
+              ('history (vector (list "Graph" 1 nil) (list "Commit" 8 nil)
+                                (list "Date" 11 nil) (list "Subject" 0 nil)))
+              ('branches [("" 1 nil) ("Branch" 32 nil) ("Upstream" 28 nil)
+                          ("Date" 11 nil) ("Subject" 0 nil)])
+              (_ [("Stash" 16 t) ("Subject" 0 t)])))
       (tabulated-list-init-header)
       (neo-git-browser-refresh))
     buffer))
@@ -2174,6 +2193,30 @@ One row per commit: ● commit, ○ merge, <─┐ merged branch, ─┘ fork po
   (interactive)
   (neo-git--browse 'history))
 
+(defun neo-git-branch-list ()
+  "Browse local and remote branches."
+  (interactive)
+  (neo-git--browse 'branches))
+
+(defun neo-git-history-toggle-all ()
+  "Toggle the history between HEAD only and all branches, remotes and tags."
+  (interactive)
+  (unless (eq neo-git--browser-kind 'history) (user-error "Open the history first"))
+  (setq neo-git--history-all (not neo-git--history-all))
+  (neo-git-browser-refresh))
+
+(defun neo-git--branch-entries (output)
+  "Parse `neo-git--branch-format' OUTPUT into tabulated entries, skipping symrefs."
+  (cl-loop for line in (split-string output "\n" t)
+           for (ref short symref head upstream track date . subject) = (split-string line "\t")
+           when (string-empty-p symref)
+           collect (list ref (vector (if (equal head "*") "*" "")
+                                     (propertize short 'face (if (equal head "*")
+                                                                 'neo-git-ref-face
+                                                               'default))
+                                     (string-trim (concat upstream " " track))
+                                     date (string-join subject "\t")))))
+
 (defun neo-git-stash-list ()
   "Browse saved stash entries."
   (interactive)
@@ -2189,10 +2232,12 @@ One row per commit: ● commit, ○ merge, <─┐ merged branch, ─┘ fork po
     (setq neo-git--browser-process
           (neo-git--run
            neo-git-root
-           (if (eq neo-git--browser-kind 'history)
-               '("log" "--topo-order" "-100" "--date=short" "--color=never"
-                 "--format=%H%x1f%P%x1f%h%x1f%ad%x1f%D%x1f%s")
-             '("stash" "list" "--format=%H%x09%gd%x09%gs"))
+           (pcase neo-git--browser-kind
+             ('history (append '("log" "--topo-order" "-100" "--date=short" "--color=never"
+                                 "--format=%H%x1f%P%x1f%h%x1f%ad%x1f%D%x1f%s")
+                               (when neo-git--history-all '("--branches" "--remotes" "--tags"))))
+             ('branches (cons "for-each-ref" neo-git--branch-format))
+             (_ '("stash" "list" "--format=%H%x09%gd%x09%gs")))
            (lambda (status output errors)
              (when (buffer-live-p buffer)
                (with-current-buffer buffer
@@ -2202,8 +2247,10 @@ One row per commit: ● commit, ○ merge, <─┐ merged branch, ─┘ fork po
                        (setq header-line-format
                              (neo-git--mode-line-literal (concat " " errors)))
                      (setq tabulated-list-entries
-                           (if (eq neo-git--browser-kind 'history)
-                               (neo-git--history-entries output)
+                           (pcase neo-git--browser-kind
+                             ('history (neo-git--history-entries output))
+                             ('branches (neo-git--branch-entries output))
+                             (_
                            (mapcar
                             (lambda (line)
                               (let* ((fields (split-string line "\t"))
@@ -2212,12 +2259,15 @@ One row per commit: ● commit, ○ merge, <─┐ merged branch, ─┘ fork po
                                       (vconcat (seq-take (cdr fields) (1- columns))
                                                (list (mapconcat #'identity
                                                                 (nthcdr columns fields) "\t"))))))
-                            (split-string output "\n" t))))
+                            (split-string output "\n" t)))))
                      (setq header-line-format
                            (if tabulated-list-entries
-                               (if (eq neo-git--browser-kind 'stash)
-                                   " RET: diff  a: apply (keep stash)  d: delete  r: refresh  q: back"
-                                 " Latest 100 commits  RET: diff  C: cherry-pick  r: refresh  q/TAB: list")
+                               (pcase neo-git--browser-kind
+                                 ('stash " SPC: apply (keep stash)  RET: diff  d: delete  r: refresh  q: back")
+                                 ('branches " SPC: switch  B: new from  R: rename  d/D: delete  RET: diff  q: back")
+                                 (_ (concat (if neo-git--history-all " All branches" " Current branch")
+                                            ", latest 100  RET: diff  a: all/current  B: branch here"
+                                            "  C: cherry-pick  q/TAB: list")))
                              " No entries  r: refresh  q: back"))
                      (tabulated-list-print t))))))))))
 
@@ -2256,48 +2306,115 @@ One row per commit: ● commit, ○ merge, <─┐ merged branch, ─┘ fork po
                  (switch-to-buffer buffer nil t))
         (pop-to-buffer buffer)))))
 
-(defun neo-git-switch-branch ()
-  "Select and switch to an existing local branch without forcing."
-  (interactive)
-  (let ((owner (neo-git--status-owner)))
-    (with-current-buffer owner
-      (neo-git--worktree-ready)
-      (neo-git--run
-       neo-git-root '("for-each-ref" "--format=%(refname:short)" "refs/heads/")
-       (lambda (status output errors)
-         (when (buffer-live-p owner)
-           (with-current-buffer owner
-             (unless neo-git--closed
-               (if (not (eq status 0)) (message "Neo Git: %s" errors)
-                 (let* ((branches (split-string output "\n" t))
-                        (branch (completing-read "Switch branch: " branches nil t)))
-                   (unless (member branch branches) (user-error "Select a local branch"))
-                   (neo-git--mutate (list "switch" "--" branch)
-                                    (concat "switch " branch) nil t)))))))))))
+(defun neo-git--branches ()
+  "Return (SHORT-NAME . FULL-REFNAME) for local and remote branches."
+  (mapcar (lambda (entry) (cons (substring-no-properties (aref (cadr entry) 1)) (car entry)))
+          (neo-git--branch-entries
+           (mapconcat #'identity (apply #'process-lines (neo-git--executable) "-C" neo-git-root
+                                        "for-each-ref" neo-git--branch-format)
+                      "\n"))))
 
-(defun neo-git-create-branch ()
-  "Create a branch at HEAD and switch to it."
+(defun neo-git--switch-ref (ref)
+  "Switch to full refname REF; a remote branch gets a local tracking branch."
+  (if (string-prefix-p "refs/heads/" ref)
+      (let ((branch (string-remove-prefix "refs/heads/" ref)))
+        (neo-git--mutate (list "switch" branch) (concat "switch " branch) nil t))
+    (let* ((remote-branch (string-remove-prefix "refs/remotes/" ref))
+           (local (substring remote-branch (1+ (string-search "/" remote-branch)))))
+      (if (zerop (process-file (neo-git--executable) nil nil nil "-C" neo-git-root
+                               "show-ref" "--verify" "--quiet" (concat "refs/heads/" local)))
+          (neo-git--mutate (list "switch" local) (concat "switch " local) nil t)
+        (neo-git--mutate (list "switch" "--track" remote-branch)
+                         (concat "switch " local " (tracking " remote-branch ")") nil t)))))
+
+(defun neo-git-switch-branch ()
+  "Switch to a local branch, or to a tracking branch of a remote one."
   (interactive)
   (with-current-buffer (neo-git--status-owner)
     (neo-git--worktree-ready)
-    (let ((branch (read-string "New branch: ")))
-      (when (or (string-empty-p branch) (string-prefix-p "-" branch)
-                (not (zerop (process-file (neo-git--executable) nil nil nil
-                                         "check-ref-format" "--branch" branch))))
-        (user-error "Invalid branch name: %s" branch))
-      (neo-git--mutate (list "switch" "-c" branch) (concat "create " branch) nil t))))
+    (let* ((branches (or (neo-git--branches) (user-error "No branch")))
+           (branch (completing-read "Switch branch: " branches nil t)))
+      (neo-git--switch-ref (cdr (assoc branch branches))))))
+
+(defun neo-git--read-branch-name (prompt &optional initial)
+  (let ((branch (read-string prompt initial)))
+    (when (or (string-empty-p branch) (string-prefix-p "-" branch)
+              (not (zerop (process-file (neo-git--executable) nil nil nil
+                                        "check-ref-format" "--branch" branch))))
+      (user-error "Invalid branch name: %s" branch))
+    branch))
+
+(defun neo-git-create-branch (&optional start)
+  "Create a branch at START (default HEAD) and switch to it."
+  (interactive)
+  (with-current-buffer (neo-git--status-owner)
+    (neo-git--worktree-ready)
+    (let ((branch (neo-git--read-branch-name
+                   (if start (format "New branch from %s: " start) "New branch: "))))
+      (neo-git--mutate (append (list "switch" "-c" branch) (and start (list start)))
+                       (concat "create " branch) nil t))))
+
+(defun neo-git--branch-at-point (&optional local)
+  "Return the full refname of the branch row; LOCAL requires a local branch."
+  (unless (eq neo-git--browser-kind 'branches) (user-error "Open the branch list first"))
+  (let ((ref (or (tabulated-list-get-id) (user-error "Select a branch"))))
+    (when (and local (not (string-prefix-p "refs/heads/" ref)))
+      (user-error "Only local branches can be renamed or deleted here"))
+    ref))
+
+(defun neo-git-browser-select ()
+  "Switch to the branch row, or apply the stash row."
+  (interactive)
+  (if (eq neo-git--browser-kind 'branches)
+      (let ((ref (neo-git--branch-at-point)))
+        (with-current-buffer (neo-git--status-owner)
+          (neo-git--worktree-ready)
+          (neo-git--switch-ref ref)))
+    (neo-git-stash-apply)))
+
+(defun neo-git-browser-create-branch ()
+  "Create and switch to a branch starting at the commit or branch row."
+  (interactive)
+  (unless (memq neo-git--browser-kind '(history branches))
+    (user-error "Open the history or branch list first"))
+  (neo-git-create-branch (or (tabulated-list-get-id) (user-error "Select a row"))))
+
+(defun neo-git--branch-delete (force)
+  (let* ((ref (neo-git--branch-at-point t))
+         (branch (string-remove-prefix "refs/heads/" ref)))
+    (when (yes-or-no-p (if force
+                           (format "Force delete %s, losing unmerged commits? " branch)
+                         (format "Delete branch %s? " branch)))
+      (with-current-buffer (neo-git--status-owner)
+        (neo-git--mutate (list "branch" (if force "-D" "-d") branch)
+                         (concat "delete " branch))))))
+
+(defun neo-git-browser-delete ()
+  "Delete the local branch row (merged only), or the stash row."
+  (interactive)
+  (if (eq neo-git--browser-kind 'branches)
+      (neo-git--branch-delete nil)
+    (neo-git-stash-drop)))
+
+(defun neo-git-branch-force-delete ()
+  "Delete the local branch row even when it is not merged."
+  (interactive)
+  (neo-git--branch-delete t))
+
+(defun neo-git-branch-rename ()
+  "Rename the local branch row."
+  (interactive)
+  (let* ((old (string-remove-prefix "refs/heads/" (neo-git--branch-at-point t)))
+         (new (neo-git--read-branch-name (format "Rename %s to: " old) old)))
+    (with-current-buffer (neo-git--status-owner)
+      (neo-git--mutate (list "branch" "-m" old new) (concat "rename " old)))))
 
 ;;; Merge, rebase and cherry-pick
 
 (defun neo-git--read-ref (prompt)
   "Read a local or remote branch other than the current one."
   (let* ((current (neo-git--current-branch))
-         (refs (cl-loop for line in (process-lines (neo-git--executable) "-C" neo-git-root
-                                                   "for-each-ref" "--format=%(refname:short)%09%(symref)"
-                                                   "refs/heads/" "refs/remotes/")
-                        for (ref symref) = (split-string line "\t")
-                        unless (or (equal ref current) (not (string-empty-p (or symref ""))))
-                        collect ref)))
+         (refs (remove current (mapcar #'car (neo-git--branches)))))
     (unless refs (user-error "No other branch"))
     (completing-read prompt refs nil t)))
 
@@ -2398,7 +2515,7 @@ Resolve conflicts and stage the files before continuing."
 (dolist (map (list neo-git-mode-map neo-git-diff-mode-map))
   (dolist (binding '(("l" . neo-git-history) ("b" . neo-git-switch-branch)
                      ("B" . neo-git-create-branch) ("s" . neo-git-stash-save)
-                     ("S" . neo-git-stash) ("3" . neo-git-switch-branch)
+                     ("S" . neo-git-stash) ("3" . neo-git-branch-list)
                      ("4" . neo-git-history) ("5" . neo-git-stash-list)
                      ("m" . neo-git-merge) ("M" . neo-git-rebase) ("A" . neo-git-continue)))
     (define-key map (kbd (car binding)) (cdr binding))))
@@ -2407,7 +2524,7 @@ Resolve conflicts and stage the files before continuing."
     (evil-define-key* '(normal motion) map
       (kbd "l") #'neo-git-history (kbd "b") #'neo-git-switch-branch
       (kbd "B") #'neo-git-create-branch (kbd "s") #'neo-git-stash-save
-      (kbd "S") #'neo-git-stash (kbd "3") #'neo-git-switch-branch
+      (kbd "S") #'neo-git-stash (kbd "3") #'neo-git-branch-list
       (kbd "4") #'neo-git-history (kbd "5") #'neo-git-stash-list
       (kbd "m") #'neo-git-merge (kbd "M") #'neo-git-rebase (kbd "A") #'neo-git-continue)))
 
