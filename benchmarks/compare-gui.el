@@ -5,11 +5,16 @@
 (require 'json)
 (defvar neo-git-compare-output (getenv "NEO_GIT_COMPARE_OUTPUT"))
 (defvar neo-git-compare-package-directory (getenv "NEO_GIT_COMPARE_PACKAGES"))
-(defvar neo-git-compare-count 10)
+(defvar neo-git-compare-count
+  (if (getenv "NEO_GIT_COMPARE_COUNT") (string-to-number (getenv "NEO_GIT_COMPARE_COUNT")) 10))
 (defvar neo-git-compare-files 200)
 (defvar neo-git-compare-samples nil)
+(defvar neo-git-compare-phases nil)
+(defconst neo-git-compare-instrumentation
+  (expand-file-name "../benchmark-git.el" (file-name-directory load-file-name)))
 (defconst neo-git-compare-source
-  (expand-file-name "../neo-git.el" (file-name-directory load-file-name)))
+  (or (getenv "NEO_GIT_COMPARE_SOURCE")
+      (expand-file-name "../neo-git.el" (file-name-directory load-file-name))))
 
 (defun neo-git-compare-git (&rest args)
   (with-temp-buffer
@@ -30,18 +35,32 @@
            (and (not neo-git--status-updating) (not neo-git--mutation)
                 (not neo-git--refresh-process) (not neo-git--refresh-pending)
                 (not neo-git--refresh-timer) (not neo-git--diff-process)
+                (not (and (boundp 'neo-git--attributes-process) neo-git--attributes-process))
                 (not neo-git--stage-prefetch) neo-git-state
                 (let ((history (get-buffer (format "*Neo Git history: %s*" root))))
                   (or (not history)
                       (not (buffer-local-value 'neo-git--browser-process history)))))))))
 
 (defun neo-git-compare-measure (tool operation action ready)
-  (let ((start (float-time)))
+  (let ((start (float-time))
+        (calls neo-git-benchmark-process-count)
+        (neo-git-compare-phases nil))
     (funcall action)
+    (push `((function . "action") (ms . ,(* 1000 (- (float-time) start)))) neo-git-compare-phases)
     (neo-git-compare-wait ready)
-    (redisplay t)
+    (let ((render-start (float-time)))
+      (redisplay t)
+      (push `((function . "redisplay") (ms . ,(* 1000 (- (float-time) render-start)))) neo-git-compare-phases))
     (push `((tool . ,tool) (operation . ,operation)
-            (ms . ,(* 1000 (- (float-time) start)))) neo-git-compare-samples)))
+            (ms . ,(* 1000 (- (float-time) start)))
+            (neo_git_processes . ,(- neo-git-benchmark-process-count calls))
+            (phases . ,(vconcat (nreverse neo-git-compare-phases)))) neo-git-compare-samples)))
+
+(defun neo-git-compare-phase (name original &rest args)
+  (let ((start (float-time)))
+    (prog1 (apply original args)
+      (push `((function . ,name)
+              (ms . ,(* 1000 (- (float-time) start)))) neo-git-compare-phases))))
 
 (defun neo-git-compare-neo-owner (root)
   (get-buffer (format "*Neo Git: %s*" (directory-file-name root))))
@@ -93,6 +112,14 @@
     (dolist (directory (directory-files neo-git-compare-package-directory t "^[^.].*"))
       (when (file-directory-p directory) (add-to-list 'load-path directory))))
   (load neo-git-compare-source nil t)
+  (load neo-git-compare-instrumentation nil t)
+  (neo-git-benchmark-start)
+  (advice-add 'neo-git--show-diff-result :around (apply-partially #'neo-git-compare-phase "show-diff"))
+  (when (fboundp 'neo-git--preview-cache-key)
+    (advice-add 'neo-git--preview-cache-key :around (apply-partially #'neo-git-compare-phase "cache-key")))
+  (advice-add 'process-file :around (apply-partially #'neo-git-compare-phase "process-file"))
+  (advice-add 'call-process-region :around (apply-partially #'neo-git-compare-phase "call-process-region"))
+  (advice-add 'call-process :around (apply-partially #'neo-git-compare-phase "call-process"))
   (require 'magit)
   (let* ((root (file-name-as-directory (make-temp-file "neo-git-compare-" t)))
          (default-directory root)
@@ -144,6 +171,15 @@
                                            (if neo
                                                (lambda () (neo-git-compare-select-neo root "file-001.txt"))
                                              (lambda () (neo-git-compare-select-magit "file-001.txt"))) ready)
+                  (if neo
+                      (progn
+                        (neo-git-compare-select-neo root "file-000.txt")
+                        (neo-git-compare-wait ready))
+                    (neo-git-compare-select-magit "file-000.txt"))
+                  (neo-git-compare-measure name "switch-back"
+                                           (if neo
+                                               (lambda () (neo-git-compare-select-neo root "file-001.txt"))
+                                             (lambda () (neo-git-compare-select-magit "file-001.txt"))) ready)
                   ;; Select an equivalent single hunk before starting the clock.
                   (if neo
                       (progn
@@ -186,7 +222,8 @@
                   (samples . ,(vconcat (nreverse neo-git-compare-samples)))))))))
       (set-window-configuration initial-windows)
       (dolist (buffer (buffer-list))
-        (when (string-prefix-p root (buffer-local-value 'default-directory buffer))
+        (when (and (buffer-live-p buffer)
+                   (string-prefix-p root (buffer-local-value 'default-directory buffer)))
           (with-current-buffer buffer (set-buffer-modified-p nil))
           (kill-buffer buffer)))
       (delete-directory root t))))

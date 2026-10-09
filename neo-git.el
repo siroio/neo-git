@@ -64,6 +64,10 @@
 (defvar-local neo-git--refresh-pending nil)
 (defvar-local neo-git--refresh-generation 0)
 (defvar-local neo-git--diff-process nil)
+(defvar-local neo-git--preview-cache nil)
+(defvar-local neo-git--attributes-process nil)
+(defvar-local neo-git--attributes-ready nil)
+(defvar-local neo-git--attributes-file nil)
 (defvar-local neo-git--diff-generation 0)
 (defvar-local neo-git--mutation nil)
 (defvar-local neo-git--mutation-label nil)
@@ -354,6 +358,7 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
   (setq-local truncate-lines t)
   (setq-local header-line-format '(:eval (neo-git--status-header-line)))
   (add-hook 'kill-buffer-hook #'neo-git--progress-stop nil t)
+  (add-hook 'kill-buffer-hook (lambda () (neo-git--clear-preview-cache t)) nil t)
   (setq-local hl-line-sticky-flag t)
   (hl-line-mode 1)
   (when (fboundp 'evil-define-key*)
@@ -719,8 +724,10 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
       (unless prefetch
         (neo-git--invalidate-stage-prefetch))
       (setq neo-git--status-updating t)
+      (neo-git--clear-preview-cache)
       (force-mode-line-update t)
       (let ((generation (cl-incf neo-git--refresh-generation)))
+        (neo-git--refresh-attributes buffer generation)
         (when (timerp neo-git--refresh-timer)
           (cancel-timer neo-git--refresh-timer))
         (setq neo-git--refresh-timer nil
@@ -775,16 +782,133 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
 
 ;;; Diff preview and navigation
 
+(defun neo-git--clear-preview-cache (&optional all)
+  "Dispose hidden cached previews, retaining the currently displayed buffer."
+  (dolist (entry neo-git--preview-cache)
+    (when (and (buffer-live-p (cdr entry))
+               (not (eq (cdr entry) neo-git--preview-buffer)))
+      (kill-buffer (cdr entry))))
+  (setq neo-git--preview-cache nil)
+  (when (and all (buffer-live-p neo-git--preview-buffer))
+    (kill-buffer neo-git--preview-buffer)))
+
+(defun neo-git--set-preview-buffer (preview)
+  (let ((old neo-git--preview-buffer))
+    (setq neo-git--preview-buffer preview)
+    (when (window-live-p neo-git--preview-window)
+      (set-window-buffer neo-git--preview-window preview))
+    (when (and (buffer-live-p old) (not (eq old preview))
+               (not (rassq old neo-git--preview-cache)))
+      (kill-buffer old))))
+
+(defun neo-git--refresh-attributes (buffer generation)
+  "Resolve the configured attributes file alongside the status query."
+  (setq neo-git--attributes-ready nil)
+  (when (process-live-p neo-git--attributes-process)
+    (delete-process neo-git--attributes-process))
+  (setq neo-git--attributes-process
+        (neo-git--run
+         neo-git-root '("config" "--path" "-z" "--get" "core.attributesFile")
+         (lambda (status output _error)
+           (when (and (buffer-live-p buffer)
+                      (= generation (buffer-local-value 'neo-git--refresh-generation buffer))
+                      (not (buffer-local-value 'neo-git--closed buffer)))
+             (with-current-buffer buffer
+               (setq neo-git--attributes-process nil
+                     neo-git--attributes-ready (memq status '(0 1))
+                     neo-git--attributes-file
+                     (cond
+                      ((and (eql status 0) (string-suffix-p (string 0) output))
+                       (expand-file-name (substring output 0 -1) neo-git-root))
+                      ((eql status 1)
+                       (expand-file-name "git/attributes"
+                                         (or (getenv "XDG_CONFIG_HOME")
+                                             (expand-file-name "~/.config/"))))
+                      (t (setq neo-git--attributes-ready nil))))))))))
+
+(defun neo-git--preview-dependency-hash (file)
+  "Hash FILE, distinguish absence, and reject unreadable or large files."
+  (if (file-exists-p file) (neo-git--preview-file-hash file) 'absent))
+
+(defun neo-git--preview-attributes-key (path gitdir)
+  "Fingerprint worktree, common-directory and user attributes for PATH."
+  (when neo-git--attributes-ready
+    (let* ((common-file (expand-file-name "commondir" gitdir))
+           (common (if (file-exists-p common-file)
+                       (with-temp-buffer
+                         (insert-file-contents common-file)
+                         (expand-file-name (string-trim (buffer-string)) gitdir))
+                     gitdir))
+           (files (list (expand-file-name "info/attributes" common)))
+           (directory (file-name-directory (expand-file-name path neo-git-root))))
+      (when neo-git--attributes-file (push neo-git--attributes-file files))
+      (while (and directory (file-in-directory-p directory neo-git-root))
+        (push (expand-file-name ".gitattributes" directory) files)
+        (setq directory (unless (equal (directory-file-name directory)
+                                       (directory-file-name neo-git-root))
+                          (file-name-directory (directory-file-name directory)))))
+      (let ((hashes (mapcar #'neo-git--preview-dependency-hash files)))
+        (when (cl-every #'identity hashes) hashes)))))
+
+(defun neo-git--preview-file-hash (file)
+  "Hash a small regular FILE, or return nil when caching is unsuitable."
+  (condition-case nil
+      (when (and (not (file-symlink-p file)) (file-regular-p file)
+                 (<= (file-attribute-size (file-attributes file)) neo-git--limit))
+        (with-temp-buffer
+          (insert-file-contents-literally file)
+          (secure-hash 'sha256 (current-buffer))))
+    (file-error nil)))
+
+(defun neo-git--preview-cache-key (path kind old-path)
+  "Identify an ordinary unstaged diff without starting Git.
+Refresh invalidates the cache.  Content hashes also detect external edits
+and index changes between refreshes, including edits with unchanged mtime."
+  (when (and (eq kind 'unstaged) (not old-path)
+             (not (getenv "GIT_INDEX_FILE")))
+    (condition-case nil
+        (let* ((dotgit (expand-file-name ".git" neo-git-root))
+               (gitdir (if (file-directory-p dotgit) dotgit
+                         (with-temp-buffer
+                           (insert-file-contents dotgit)
+                           (when (looking-at "gitdir: \\(.*\\)$")
+                             (expand-file-name (string-trim (match-string 1)) neo-git-root)))))
+               (file (expand-file-name path neo-git-root))
+               (index-hash (and gitdir (neo-git--preview-file-hash (expand-file-name "index" gitdir))))
+               (file-hash (neo-git--preview-file-hash file))
+               (attributes (and gitdir (neo-git--preview-attributes-key path gitdir))))
+          (when (and index-hash file-hash attributes)
+            (list neo-git--refresh-generation path kind index-hash file-hash
+                  (file-modes file) attributes)))
+      (file-error nil))))
+
 (defun neo-git--preview-selected ()
   (neo-git--invalidate-stage-prefetch)
   (let* ((entry (neo-git--entry-at-point))
          (buffer (current-buffer))
          (preview neo-git--preview-buffer)
+         (key (and entry (neo-git--preview-cache-key
+                          (plist-get entry :path) (plist-get entry :kind)
+                          (plist-get entry :old-path))))
+         (cached (and key (assoc key neo-git--preview-cache)))
          (generation (cl-incf neo-git--diff-generation)))
+    (unless (and cached (buffer-live-p (cdr cached))
+                 (with-current-buffer (cdr cached)
+                   (and (derived-mode-p 'diff-mode)
+                        (equal neo-git--diff-id (list (plist-get entry :path) (plist-get entry :kind)))
+                        (equal neo-git--diff-source (buffer-substring-no-properties (point-min) (point-max))))))
+      (setq cached nil))
     (setq neo-git--current-selection
           (and entry (list (plist-get entry :path) (plist-get entry :kind))))
     (when (process-live-p neo-git--diff-process)
       (delete-process neo-git--diff-process))
+    (setq neo-git--diff-process nil)
+    ;; Keep rendered hunks and their refinement overlays in cached buffers.
+    ;; Never overwrite one when selecting an uncached or untracked file.
+    (when (and (not cached) (buffer-live-p preview)
+               (rassq preview neo-git--preview-cache))
+      (setq preview (generate-new-buffer (format "*Neo Git Diff: %s*" (secure-hash 'sha1 neo-git-root))))
+      (neo-git--set-preview-buffer preview))
     (if (and entry preview (buffer-live-p preview))
         (if (eq (plist-get entry :kind) 'untracked)
             (let ((file (expand-file-name (plist-get entry :path) neo-git-root)))
@@ -814,28 +938,49 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
           (let ((kind (plist-get entry :kind))
                 (path (plist-get entry :path))
                 (old (plist-get entry :old-path)))
-            (with-current-buffer preview
-              (setq-local neo-git--diff-updating t)
-              (force-mode-line-update t))
-            (setq neo-git--diff-process
-                  (neo-git--run neo-git-root
-                                (neo-git--diff-arguments path kind old)
-                                (lambda (status output error-output)
-                                  (when (and (buffer-live-p buffer)
-                                             (not (buffer-local-value 'neo-git--closed buffer))
-                                             (= generation (buffer-local-value 'neo-git--diff-generation buffer))
-                                             (equal (list path kind)
-                                                    (buffer-local-value 'neo-git--current-selection buffer)))
-                                    (with-current-buffer preview
-                                      (setq neo-git--diff-updating nil))
-                                    (neo-git--show-diff-result buffer preview
-                                                               status output error-output
-                                                               (list path kind) generation))
-                                  (when (and (buffer-live-p buffer)
-                                             (= generation (buffer-local-value 'neo-git--diff-generation buffer)))
-                                    (with-current-buffer buffer
-                                      (setq neo-git--diff-process nil))))
-          neo-git--limit))))
+            (let ()
+              (if cached
+                  (progn
+                    (setq preview (cdr cached))
+                    (neo-git--set-preview-buffer preview)
+                    (with-current-buffer preview
+                      (setq neo-git--diff-generation generation
+                            neo-git--diff-updating nil
+                            mark-active nil
+                            neo-git--diff-visual-inclusive nil)
+                      (when (and (fboundp 'evil-visual-state-p) (evil-visual-state-p))
+                        (evil-normal-state))))
+                (with-current-buffer preview
+                  (setq-local neo-git--diff-updating t)
+                  (force-mode-line-update t))
+                (setq neo-git--diff-process
+                      (neo-git--run neo-git-root
+                                    (neo-git--diff-arguments path kind old)
+                                    (lambda (status output error-output)
+                                      (when (and (buffer-live-p buffer)
+                                                 (not (buffer-local-value 'neo-git--closed buffer))
+                                                 (= generation (buffer-local-value 'neo-git--diff-generation buffer))
+                                                 (equal (list path kind)
+                                                        (buffer-local-value 'neo-git--current-selection buffer)))
+                                        (with-current-buffer preview
+                                          (setq neo-git--diff-updating nil))
+                                        (with-current-buffer buffer
+                                          (when (and key (integerp status) (zerop status)
+                                                     (equal key (neo-git--preview-cache-key path kind old)))
+                                            ;; At most eight 1 MiB previews per status buffer.
+                                            (push (cons key preview) neo-git--preview-cache)
+                                            (when (> (length neo-git--preview-cache) 8)
+                                              (when (buffer-live-p (cdr (nth 8 neo-git--preview-cache)))
+                                                (kill-buffer (cdr (nth 8 neo-git--preview-cache))))
+                                              (setcdr (nthcdr 7 neo-git--preview-cache) nil))))
+                                        (neo-git--show-diff-result buffer preview
+                                                                   status output error-output
+                                                                   (list path kind) generation))
+                                      (when (and (buffer-live-p buffer)
+                                                 (= generation (buffer-local-value 'neo-git--diff-generation buffer)))
+                                        (with-current-buffer buffer
+                                          (setq neo-git--diff-process nil))))
+                                    neo-git--limit))))))
       (when (and preview (buffer-live-p preview))
         (with-current-buffer preview
           (let ((inhibit-read-only t))
@@ -1195,7 +1340,8 @@ C-c C-n/p move; C-c C-m/o/b keep upper/lower/both; C-c C-e opens Ediff."
         (insert (cond ((eq status 'output-limit) "[Diff truncated at 1 MiB]\n")
                       ((and (integerp status) (zerop status)) output)
                       (t (format "[Diff failed: %s]\n" error-output))))
-        (diff-mode)
+        (unless (derived-mode-p 'diff-mode) (diff-mode))
+        (setq-local neo-git--diff-updating nil)
         (setq-local neo-git--diff-owner owner)
         (setq-local neo-git--diff-source
                     (and (integerp status) (zerop status) output))
@@ -1673,6 +1819,10 @@ With DISCARD, revert the selected unstaged lines/hunks in the worktree."
     (when (process-live-p neo-git--refresh-process)
       (delete-process neo-git--refresh-process))
     (setq neo-git--refresh-process nil)
+    (when (process-live-p neo-git--attributes-process)
+      (delete-process neo-git--attributes-process))
+    (setq neo-git--attributes-process nil)
+    (neo-git--clear-preview-cache)
     (when (process-live-p neo-git--diff-process)
       (delete-process neo-git--diff-process))
     (setq neo-git--diff-process nil)
