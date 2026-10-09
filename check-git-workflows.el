@@ -151,6 +151,8 @@
         (with-temp-file "file.txt" (insert "theirs\n"))
         (neo-git-workflow-output root "commit" "-qam" "theirs")
         (neo-git-workflow-output root "switch" "-q" "main")
+        ;; Git commands above changed this visited file outside Emacs.
+        (with-current-buffer file-buffer (revert-buffer t t))
         (with-temp-file "file.txt" (insert "ours\n"))
         (neo-git-workflow-output root "commit" "-qam" "ours")
         (with-current-buffer owner
@@ -167,6 +169,7 @@
             (condition-case nil (neo-git--stage-entries (list conflict))
               (user-error (setq rejected t)))
             (cl-assert rejected)
+            (with-current-buffer file-buffer (revert-buffer t t))
             (with-temp-file "file.txt" (insert "resolved\n"))
             (neo-git--stage-entries (list conflict)))
           (neo-git-workflow-wait (lambda () (not neo-git--mutation)))
@@ -179,6 +182,7 @@
         (with-current-buffer file-buffer (cl-assert (equal (buffer-string) "resolved\n")))
         ;; A conflicting cherry-pick can be aborted back to the previous state.
         (neo-git-workflow-output root "switch" "-qc" "pick" "main~1")
+        (with-current-buffer file-buffer (revert-buffer t t))
         (with-temp-file "file.txt" (insert "picked\n"))
         (neo-git-workflow-output root "commit" "-qam" "pick me")
         (let ((oid (neo-git-workflow-output root "rev-parse" "HEAD")))

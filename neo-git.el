@@ -20,6 +20,22 @@
 (require 'hl-line)
 (require 'tabulated-list)
 
+(defvar server-buffer-clients)
+(defvar server-clients)
+(defvar server-process)
+(defvar server-name)
+(defvar server-use-tcp)
+(defvar server-auth-dir)
+(defvar server-socket-dir)
+(declare-function server-running-p "server" (&optional name))
+(declare-function server-edit "server" (&optional arg))
+(declare-function server-edit-abort "server" ())
+(declare-function smerge-next "smerge-mode" (&optional arg))
+(declare-function smerge-prev "smerge-mode" (&optional arg))
+(declare-function smerge-keep-upper "smerge-mode" ())
+(declare-function smerge-keep-lower "smerge-mode" ())
+(declare-function smerge-keep-all "smerge-mode" ())
+
 ;;; Buffer state
 
 (defgroup neo-git nil "A small Git status interface."
@@ -58,6 +74,8 @@
 (defvar-local neo-git--status-updating nil)
 (defvar-local neo-git--partial-operation nil)
 (defvar-local neo-git--last-error nil)
+(defvar-local neo-git--editor-directory nil)
+(defvar-local neo-git--browser-kind nil)
 (defvar-local neo-git--preview-buffer nil)
 (defvar-local neo-git--preview-window nil)
 (defvar-local neo-git--history-window nil)
@@ -81,6 +99,8 @@
 (defconst neo-git--log-limit 80)
 (defconst neo-git--log-text-limit 4096)
 (defconst neo-git--stderr-limit (* 64 1024))
+(defvar neo-git--interactive-editor nil
+  "Editor command for an explicitly interactive Git operation.")
 
 ;;; Git executable and asynchronous processes
 
@@ -180,8 +200,11 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
                      (goto-char (point-max))
                      (insert chunk))))))))
       (condition-case failure
-          (let ((process-environment (cons "GIT_EDITOR=true" process-environment)))
-            ;; No terminal to edit in: continue commands keep Git's prepared message.
+          (let ((process-environment
+                 (cons (concat "GIT_EDITOR=" (or neo-git--interactive-editor "true"))
+                       process-environment)))
+            ;; Ordinary operations keep Git's prepared message. Interactive
+            ;; operations explicitly route editing back into this Emacs.
             (setq process
                   (make-process :name "neo-git" :buffer out :stderr err
                                 :command (cons (neo-git--executable)
@@ -833,7 +856,9 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
   (unless (buffer-live-p neo-git--preview-buffer)
     (setq neo-git--preview-buffer
           (get-buffer-create (format "*Neo Git Diff: %s*" (secure-hash 'sha1 neo-git-root)))))
-  (unless (window-live-p neo-git--preview-window)
+  (unless (and (window-live-p neo-git--preview-window)
+               (eq (window-buffer neo-git--preview-window) neo-git--preview-buffer))
+    (setq neo-git--preview-window nil)
     (let ((window (get-buffer-window (current-buffer))))
       (when (and window (> (window-total-width window) 100))
         (setq neo-git--preview-window (split-window-right (max 45 (/ (window-total-width window) 2))))
@@ -908,7 +933,79 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
   (let ((entry (neo-git--entry-at-point)))
     (unless entry
       (user-error "No file selected"))
-    (find-file (expand-file-name (plist-get entry :path) neo-git-root))))
+    (if (eq (plist-get entry :kind) 'conflict)
+        (neo-git-resolve-conflict)
+      (find-file (expand-file-name (plist-get entry :path) neo-git-root)))))
+
+(defvar-local neo-git--conflict-owner nil)
+(defvar neo-git-conflict-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-c C-c") #'neo-git-conflict-finish)
+    (define-key map (kbd "C-c C-k") #'neo-git-conflict-return)
+    (define-key map (kbd "C-c C-n") #'smerge-next)
+    (define-key map (kbd "C-c C-p") #'smerge-prev)
+    (define-key map (kbd "C-c C-m") #'smerge-keep-upper)
+    (define-key map (kbd "C-c C-o") #'smerge-keep-lower)
+    (define-key map (kbd "C-c C-b") #'smerge-keep-all)
+    (define-key map (kbd "C-c C-e") #'smerge-ediff)
+    map))
+
+(define-minor-mode neo-git-conflict-mode
+  "Resolve a Neo Git conflict with Smerge, then save and stage.
+C-c C-c saves and stages; C-c C-k returns without staging.
+C-c C-n/p move; C-c C-m/o/b keep upper/lower/both; C-c C-e opens Ediff."
+  :lighter " Neo-Resolve" :keymap neo-git-conflict-mode-map)
+
+(defun neo-git-resolve-conflict ()
+  "Visit the selected conflict and position point at its first marker."
+  (interactive)
+  (let* ((owner (neo-git--status-owner))
+         (entry (if (derived-mode-p 'diff-mode)
+                    (with-current-buffer owner (neo-git--entry-at-point))
+                  (neo-git--entry-at-point)))
+         (root (buffer-local-value 'neo-git-root owner)))
+    (unless (eq (plist-get entry :kind) 'conflict)
+      (user-error "Select a conflicted file"))
+    (let ((file (expand-file-name (plist-get entry :path) root)))
+      (unless (file-regular-p file)
+        (user-error "This conflict has no worktree file; resolve the deletion from Git"))
+      (find-file file)
+      (require 'smerge-mode)
+      (setq-local neo-git--conflict-owner owner)
+      (smerge-mode 1)
+      (neo-git-conflict-mode 1)
+      (goto-char (point-min))
+      (when (re-search-forward "^<<<<<<< " nil t) (beginning-of-line))
+      (message "Resolve: C-c C-m/o/b keep upper/lower/both; C-c C-c save and stage"))))
+
+(defun neo-git-conflict-return ()
+  "Return to the owning status screen without staging or discarding edits."
+  (interactive)
+  (unless (buffer-live-p neo-git--conflict-owner)
+    (user-error "The Git status buffer is closed"))
+  (pop-to-buffer neo-git--conflict-owner))
+
+(defun neo-git-conflict-finish ()
+  "Refuse unresolved markers, then save and stage only this file."
+  (interactive)
+  (let ((owner neo-git--conflict-owner)
+        (file buffer-file-name))
+    (unless (and file (buffer-live-p owner)) (user-error "No active conflict file"))
+    (save-restriction
+      (widen)
+      (save-excursion
+        (goto-char (point-min))
+        (when (re-search-forward
+               "^\\(?:<\\{7,\\}\\|=\\{7,\\}\\|>\\{7,\\}\\||\\{7,\\}\\)\\(?: \\|$\\)" nil t)
+          (user-error "Resolve all conflict markers before staging"))))
+    (when (buffer-local-value 'neo-git--mutation owner)
+      (user-error "Git operation already running"))
+    (save-buffer)
+    (with-current-buffer owner
+      (neo-git--mutate (list "add" "--" (concat ":(literal)" (file-relative-name file neo-git-root)))
+                       "stage resolved conflict"))
+    (neo-git-conflict-mode -1)
+    (pop-to-buffer owner)))
 
 (defun neo-git-diff-visit-line ()
   "Visit the corresponding real worktree line from the selected diff line."
@@ -1631,6 +1728,7 @@ With DISCARD, revert the selected unstaged lines/hunks in the worktree."
                          (lambda (status _output error-output)
                            (when (buffer-live-p buffer)
                              (with-current-buffer buffer
+                               (setq neo-git--editor-directory nil)
                                (setq neo-git--mutation nil
                                      neo-git--mutation-label nil)
                                (neo-git--progress-stop)
@@ -1799,20 +1897,80 @@ Unstaged files are restored from the index; untracked files are deleted."
         (neo-git--render '(:kind staged))
         (neo-git--mutate '("rm" "--cached" "-r" "-f" ".") "Unstage all files")))))
 
-(defun neo-git-commit ()
+(defvar-local neo-git--commit-kind nil)
+(defvar-local neo-git--commit-head nil)
+
+(defun neo-git--commit-head ()
+  "Return HEAD's full object name, or signal a user error."
+  (let ((root neo-git-root))
+    (with-temp-buffer
+      (unless (zerop (process-file (neo-git--executable) nil t nil
+                                  "-C" root "rev-parse" "--verify" "HEAD"))
+        (user-error "There is no commit to edit"))
+      (string-trim (buffer-string)))))
+
+(defun neo-git-commit-menu ()
+  "Choose a commit operation for the status or selected history commit."
   (interactive)
+  (let ((target (and (eq neo-git--browser-kind 'history) (tabulated-list-get-id)))
+        (owner (neo-git--status-owner)))
+    (with-current-buffer owner
+      (pcase (read-char-choice
+              "Commit: [c] new  [a] amend HEAD  [w] reword HEAD  [f] fixup  [q] cancel "
+              '(?c ?a ?w ?f ?q))
+        (?c (neo-git-commit))
+        (?a (neo-git-commit 'amend))
+        (?w (neo-git-commit 'reword))
+        (?f (neo-git-commit-fixup target))))))
+
+(defun neo-git-commit-fixup (&optional target)
+  "Create a fixup commit targeting a commit reachable from HEAD."
+  (interactive)
+  (when (or neo-git--mutation (neo-git--in-progress-p))
+    (user-error "Finish the current Git operation first"))
+  (unless (seq-some (lambda (e) (eq (plist-get e :kind) 'staged)) neo-git-entries)
+    (user-error "Stage changes before creating a fixup"))
+  (let* ((head (neo-git--commit-head))
+         (choices (process-lines (neo-git--executable) "-C" neo-git-root
+                                 "log" "-100" "--format=%H %s"))
+         (ref (or target (car (split-string
+                              (completing-read "Fixup commit: " choices nil t)))))
+         (oid (car (process-lines (neo-git--executable) "-C" neo-git-root
+                                  "rev-parse" "--verify" (concat ref "^{commit}")))))
+    (unless (zerop (process-file (neo-git--executable) nil nil nil "-C" neo-git-root
+                                "merge-base" "--is-ancestor" oid head))
+      (user-error "Fixup target must be an ancestor of HEAD"))
+    (neo-git--mutate (list "commit" (concat "--fixup=" oid) "--no-edit")
+                     (concat "fixup " (substring oid 0 8)))))
+
+(defun neo-git-commit (&optional kind)
+  "Edit a new commit message, or amend/reword HEAD according to KIND."
+  (interactive)
+  (unless (memq kind '(nil amend reword)) (user-error "Unknown commit operation"))
   (when neo-git--mutation
     (user-error "Git operation already running"))
-  (when (not (seq-some (lambda (e)
-                         (eq (plist-get e :kind) 'staged)) neo-git-entries))
+  (when (and kind (neo-git--in-progress-p))
+    (user-error "Finish the current Git operation before editing a commit"))
+  (when (and (not kind) (not (seq-some (lambda (e)
+                                       (eq (plist-get e :kind) 'staged)) neo-git-entries)))
     (user-error "Stage changes before committing"))
   (let* ((status-buffer (current-buffer))
+         (head (and kind (neo-git--commit-head)))
          (staged (seq-filter (lambda (e) (eq (plist-get e :kind) 'staged)) neo-git-entries))
-         (buffer (get-buffer-create (format "*Neo Git Commit: %s*"
+         (buffer (get-buffer-create (format "*Neo Git Commit %s: %s*" (or kind 'new)
                                             (directory-file-name neo-git-root)))))
+    (when (and kind
+               (not (yes-or-no-p (format "%s HEAD %s? This rewrites the commit. "
+                                         (capitalize (symbol-name kind)) (substring head 0 8)))))
+      (user-error "Commit editing cancelled"))
     (with-current-buffer buffer
       (unless (eq major-mode 'text-mode)
         (text-mode))
+      (when (and kind (zerop (buffer-size)))
+        (let ((coding-system-for-read 'utf-8-unix))
+          (process-file (neo-git--executable) nil t nil "-C"
+                        (buffer-local-value 'neo-git-root status-buffer)
+                        "log" "-1" "--format=%B")))
       ;; Like git commit: a '#' summary of staged files, stripped on finish.
       (save-excursion
         (goto-char (point-min))
@@ -1820,20 +1978,25 @@ Unstaged files are restored from the index; untracked files are deleted."
         (goto-char (point-max))
         (skip-chars-backward " \t\n")
         (delete-region (point) (point-max))
-        (insert "\n\n# Lines starting with '#' are ignored.\n# Changes to be committed:\n")
-        (dolist (entry staged)
+        (insert "\n\n# Lines starting with '#' are ignored.\n"
+                (if (eq kind 'reword) "# Message only; staged changes remain staged.\n"
+                  "# Changes to be committed:\n"))
+        (dolist (entry (unless (eq kind 'reword) staged))
           (insert "#\t" (if (plist-get entry :old-path)
                             (format "%s -> " (plist-get entry :old-path))
                           "")
                   (plist-get entry :path) "\n")))
       (setq-local neo-git--commit-status-buffer status-buffer
+                  neo-git--commit-kind kind
+                  neo-git--commit-head head
                   neo-git--commit-root (buffer-local-value 'neo-git-root status-buffer))
       (use-local-map (copy-keymap text-mode-map))
       (local-set-key (kbd "C-c C-c") #'neo-git-commit-finish)
       (local-set-key (kbd "C-c C-k") #'neo-git-commit-cancel))
     (switch-to-buffer buffer)
     (when (fboundp 'evil-insert-state)
-      (evil-insert-state))))
+      (evil-insert-state))
+    buffer))
 
 (defvar-local neo-git--commit-status-buffer nil)
 (defvar-local neo-git--commit-root nil)
@@ -1841,6 +2004,8 @@ Unstaged files are restored from the index; untracked files are deleted."
 (defun neo-git-commit-finish ()
   (interactive)
   (let ((message-text (string-trim (replace-regexp-in-string "^#.*\n?" "" (buffer-string))))
+        (kind neo-git--commit-kind)
+        (head neo-git--commit-head)
         (status-buffer neo-git--commit-status-buffer))
     (when (string-empty-p message-text)
       (user-error "Commit message is empty"))
@@ -1848,6 +2013,11 @@ Unstaged files are restored from the index; untracked files are deleted."
       (user-error "Git status screen is closed"))
     (when (buffer-local-value 'neo-git--mutation status-buffer)
       (user-error "Git operation already running"))
+    (when kind
+      (with-current-buffer status-buffer
+        (when (neo-git--in-progress-p) (user-error "Finish the current Git operation first"))
+        (unless (equal head (neo-git--commit-head))
+          (user-error "HEAD changed since this draft was opened; reopen commit editing"))))
     (let ((file (make-temp-file "neo-git-message-"))
           (commit-buffer (current-buffer)))
       (let ((coding-system-for-write 'utf-8-unix))
@@ -1861,7 +2031,10 @@ Unstaged files are restored from the index; untracked files are deleted."
         (neo-git--render)
         (let ((process
                (neo-git--run
-                neo-git-root (list "commit" "-F" file)
+                neo-git-root (append '("commit")
+                                     (when kind '("--amend"))
+                                     (when (eq kind 'reword) '("--only"))
+                                     (list "-F" file))
                 (lambda (status _output error-output)
                   (when (file-exists-p file)
                     (delete-file file))
@@ -1972,12 +2145,184 @@ Unstaged files are restored from the index; untracked files are deleted."
 
 ;;; History, branches and stash
 
+(defvar neo-git-sequence-mode-map
+  (let ((map (make-sparse-keymap)))
+    (set-keymap-parent map text-mode-map)
+    (define-key map (kbd "C-c C-c") #'neo-git-editor-finish)
+    (define-key map (kbd "C-c C-k") #'neo-git-editor-cancel)
+    (define-key map (kbd "C-c C-a") #'neo-git-sequence-action)
+    map))
+
+(define-derived-mode neo-git-sequence-mode text-mode "Neo-Git-Rebase"
+  "Edit Git's rebase sequence. Reorder lines with normal editing commands.
+C-c C-a chooses pick/reword/edit/squash/fixup/drop for the current line.
+C-c C-c saves and continues; C-c C-k cancels this editor invocation."
+  (setq-local header-line-format
+              " Reorder lines; C-c C-a: action  C-c C-c: run  C-c C-k: cancel"))
+
+(defun neo-git-sequence-action ()
+  "Change the action of the current rebase todo line."
+  (interactive)
+  (beginning-of-line)
+  (unless (looking-at "\\(?:pick\\|reword\\|edit\\|squash\\|fixup\\|drop\\|[presfd]\\) ")
+    (user-error "Select a commit action; merge structure lines must remain intact"))
+  (let ((end (match-end 0))
+        (action (completing-read "Action: " '("pick" "reword" "edit" "squash" "fixup" "drop") nil t)))
+    (delete-region (point) end)
+    (insert action " ")))
+
+(defun neo-git-editor-finish ()
+  "Save the Git editor buffer and release its waiting emacsclient."
+  (interactive)
+  (require 'server)
+  (unless server-buffer-clients (user-error "This buffer has no waiting Git editor"))
+  (save-buffer)
+  (server-edit))
+
+(defun neo-git-editor-cancel ()
+  "Cancel only the clients editing this Git buffer, leaving the draft intact."
+  (interactive)
+  (require 'server)
+  (unless server-buffer-clients (user-error "This buffer has no waiting Git editor"))
+  ;; `server-edit-abort' broadcasts to all clients. Restrict it to this file.
+  (let ((server-clients server-buffer-clients)) (server-edit-abort)))
+
+(defun neo-git--prepare-editor-buffer ()
+  "Set up an editor buffer requested by a running Neo Git operation."
+  (when buffer-file-name
+    (let* ((file buffer-file-name)
+           (owner (cl-find-if
+                   (lambda (buffer)
+                     (let ((directory (buffer-local-value 'neo-git--editor-directory buffer)))
+                       (and directory (buffer-local-value 'neo-git--mutation buffer)
+                            (file-in-directory-p file directory))))
+                   (buffer-list))))
+      (when owner
+        (if (equal (file-name-nondirectory file) "git-rebase-todo")
+            (neo-git-sequence-mode)
+          (text-mode)
+          (use-local-map (copy-keymap text-mode-map))
+          (local-set-key (kbd "C-c C-c") #'neo-git-editor-finish)
+          (local-set-key (kbd "C-c C-k") #'neo-git-editor-cancel)
+          (setq-local header-line-format " Git message: C-c C-c: save/continue  C-c C-k: cancel"))
+        (when (fboundp 'evil-insert-state) (evil-insert-state))))))
+
+(defun neo-git--mutate-with-editor (arguments label worktree)
+  "Run ARGUMENTS with Git's message and sequence editors in this Emacs."
+  (when neo-git--mutation (user-error "Git operation already running"))
+  (when worktree (neo-git--worktree-ready (eq worktree 'resume)))
+  (require 'server)
+  (let ((client (or (executable-find "emacsclient")
+                    (let ((file (expand-file-name
+                                 (if (eq system-type 'windows-nt) "emacsclient.exe" "emacsclient")
+                                 invocation-directory)))
+                      (and (file-executable-p file) file)))))
+    (unless client (user-error "emacsclient is required for interactive Git editing"))
+    (unless (process-live-p server-process)
+      ;; Do not replace an existing server belonging to a different Emacs.
+      (when (server-running-p server-name)
+        (setq server-name (format "neo-git-%s" (emacs-pid))))
+      (server-start))
+    (add-hook 'server-switch-hook #'neo-git--prepare-editor-buffer)
+    (let* ((endpoint (expand-file-name server-name
+                                      (if server-use-tcp server-auth-dir server-socket-dir)))
+           (editor (mapconcat #'shell-quote-argument
+                              (list client (if server-use-tcp "--server-file" "--socket-name")
+                                    endpoint) " "))
+           (process-environment (copy-sequence process-environment))
+           (neo-git--interactive-editor editor))
+      (setenv "GIT_EDITOR" editor)
+      (setenv "GIT_SEQUENCE_EDITOR" editor)
+      (setq neo-git--editor-directory
+            (file-name-as-directory
+             (car (process-lines (neo-git--executable) "-C" neo-git-root
+                                 "rev-parse" "--absolute-git-dir"))))
+      (condition-case err
+          (neo-git--mutate arguments label nil worktree)
+        (error (setq neo-git--editor-directory nil)
+               (signal (car err) (cdr err)))))))
+
+(defun neo-git-rebase-interactive (&optional base autosquash)
+  "Edit the rebase sequence after BASE, optionally with AUTOSQUASH."
+  (interactive)
+  (with-current-buffer (neo-git--status-owner)
+    (neo-git--worktree-ready)
+    (let* ((ref (or base (read-string "Rebase commits after (base): " "HEAD~1")))
+           (oid (car (process-lines (neo-git--executable) "-C" neo-git-root
+                                    "rev-parse" "--verify" (concat ref "^{commit}")))))
+      (unless (zerop (process-file (neo-git--executable) nil nil nil "-C" neo-git-root
+                                  "merge-base" "--is-ancestor" oid "HEAD"))
+        (user-error "Choose an ancestor of HEAD as the rebase base"))
+      (when (yes-or-no-p (format "Rewrite commits after %s%s? " (substring oid 0 8)
+                                (if autosquash " with autosquash" "")))
+        (neo-git--mutate-with-editor
+         (append '("rebase" "--interactive" "--rebase-merges")
+                 (when autosquash '("--autosquash")) (list oid))
+         "interactive rebase" t)))))
+
+(defun neo-git-rebase-menu ()
+  "Choose a normal rebase, interactive rebase, or autosquash."
+  (interactive)
+  (pcase (read-char-choice "Rebase: [r] onto branch  [i] interactive  [a] autosquash  [q] cancel "
+                          '(?r ?i ?a ?q))
+    (?r (neo-git-rebase))
+    (?i (neo-git-rebase-interactive))
+    (?a (neo-git-rebase-interactive nil t))))
+
+(defun neo-git--selected-commit ()
+  "Return the history/reflog commit at point, or read and resolve a ref."
+  (let ((ref (or (and (memq neo-git--browser-kind '(history reflog)) (tabulated-list-get-id))
+                 (read-string "Commit: " "HEAD")))
+        (root neo-git-root))
+    (when (string-prefix-p "-" ref) (user-error "Invalid commit reference"))
+    (car (process-lines (neo-git--executable) "-C" root
+                       "rev-parse" "--verify" (concat ref "^{commit}")))))
+
+(defun neo-git-recover-commit (&optional oid)
+  "Create a recovery branch at OID without changing HEAD or the worktree."
+  (interactive)
+  (let ((target (or oid (neo-git--selected-commit)))
+        (owner (or (neo-git--owner-buffer) (current-buffer))))
+    (with-current-buffer owner
+      (let ((name (neo-git--read-branch-name "Recovery branch name: ")))
+        (neo-git--mutate (list "branch" name target) (concat "recover " name))))))
+
+(defun neo-git-revert-commit (&optional oid)
+  "Create a new commit undoing OID; merge commits require a separate Git command."
+  (interactive)
+  (let ((target (or oid (neo-git--selected-commit)))
+        (owner (neo-git--status-owner)))
+    (with-current-buffer owner
+      (neo-git--worktree-ready)
+      (when (yes-or-no-p (format "Revert %s with a new commit? " (substring target 0 8)))
+        (neo-git--mutate (list "revert" "--no-edit" target) "revert commit" nil t)))))
+
+(defun neo-git-reset-commit ()
+  "Reset to a selected commit with an explicit soft/mixed/hard choice."
+  (interactive)
+  (let ((target (neo-git--selected-commit)) (owner (neo-git--status-owner)))
+    (with-current-buffer owner
+      (neo-git--worktree-ready)
+      (let ((mode (completing-read "Reset mode: " '("soft" "mixed" "hard") nil t)))
+        (when (yes-or-no-p (format "Reset %s to %s%s? " mode (substring target 0 8)
+                                  (if (equal mode "hard") "; tracked local changes will be discarded" "")))
+          (neo-git--mutate (list "reset" (concat "--" mode) target) "reset commit" nil t))))))
+
+(defun neo-git-recovery-menu ()
+  "Choose a reflog, recovery branch, revert or reset operation."
+  (interactive)
+  (pcase (read-char-choice "Recovery: [l] reflog  [b] recovery branch  [v] revert  [r] reset  [q] cancel "
+                          '(?l ?b ?v ?r ?q))
+    (?l (neo-git--browse 'reflog))
+    (?b (neo-git-recover-commit))
+    (?v (neo-git-revert-commit))
+    (?r (neo-git-reset-commit))))
+
 (defconst neo-git--branch-format
   '("--format=%(refname)%09%(refname:short)%09%(symref)%09%(HEAD)%09%(upstream:short)%09%(upstream:track)%09%(committerdate:short)%09%(subject)"
     "refs/heads/" "refs/remotes/")
   "`for-each-ref' arguments listing local, then remote branches.")
 
-(defvar-local neo-git--browser-kind nil)
 (defvar-local neo-git--history-all nil
   "Non-nil when the history pane shows all branches, remotes and tags.")
 (defvar-local neo-git--browser-process nil)
@@ -2093,6 +2438,7 @@ RESUME permits a merge/rebase in progress, for continuing or aborting it."
                                 (list "Date" 11 nil) (list "Subject" 0 nil)))
               ('branches [("" 1 nil) ("Branch" 32 nil) ("Upstream" 28 nil)
                           ("Date" 11 nil) ("Subject" 0 nil)])
+              ('reflog [("Reflog" 20 nil) ("Operation" 0 nil)])
               (_ [("Stash" 16 t) ("Subject" 0 t)])))
       (tabulated-list-init-header)
       (neo-git-browser-refresh))
@@ -2237,6 +2583,7 @@ One row per commit: ● commit, ○ merge, <─┐ merged branch, ─┘ fork po
                                  "--format=%H%x1f%P%x1f%h%x1f%ad%x1f%D%x1f%s")
                                (when neo-git--history-all '("--branches" "--remotes" "--tags"))))
              ('branches (cons "for-each-ref" neo-git--branch-format))
+             ('reflog '("reflog" "-100" "--format=%H%x09%gd%x09%gs"))
              (_ '("stash" "list" "--format=%H%x09%gd%x09%gs")))
            (lambda (status output errors)
              (when (buffer-live-p buffer)
@@ -2265,6 +2612,7 @@ One row per commit: ● commit, ○ merge, <─┐ merged branch, ─┘ fork po
                                (pcase neo-git--browser-kind
                                  ('stash " SPC: apply (keep stash)  RET: diff  d: delete  r: refresh  q: back")
                                  ('branches " SPC: switch  B: new from  R: rename  d/D: delete  RET: diff  q: back")
+                                 ('reflog " Reflog: RET: diff  B: recovery branch  z: recovery menu  q: back")
                                  (_ (concat (if neo-git--history-all " All branches" " Current branch")
                                             ", latest 100  RET: diff  a: all/current  B: branch here"
                                             "  C: cherry-pick  q/TAB: list")))
@@ -2373,11 +2721,14 @@ One row per commit: ● commit, ○ merge, <─┐ merged branch, ─┘ fork po
     (neo-git-stash-apply)))
 
 (defun neo-git-browser-create-branch ()
-  "Create and switch to a branch starting at the commit or branch row."
+  "Create a branch from a row; reflog recovery preserves the current branch."
   (interactive)
-  (unless (memq neo-git--browser-kind '(history branches))
+  (unless (memq neo-git--browser-kind '(history branches reflog))
     (user-error "Open the history or branch list first"))
-  (neo-git-create-branch (or (tabulated-list-get-id) (user-error "Select a row"))))
+  (let ((oid (or (tabulated-list-get-id) (user-error "Select a row"))))
+    (if (eq neo-git--browser-kind 'reflog)
+        (neo-git-recover-commit oid)
+      (neo-git-create-branch oid))))
 
 (defun neo-git--branch-delete (force)
   (let* ((ref (neo-git--branch-at-point t))
@@ -2466,8 +2817,11 @@ Resolve conflicts and stage the files before continuing."
                                            operation))))
         (setq action nil))
       (when action
-        (neo-git--mutate (list operation action)
-                         (format "%s %s" operation (substring action 2)) nil 'resume)))))
+        (if (and (equal action "--continue") (equal operation "rebase"))
+            (neo-git--mutate-with-editor (list operation action)
+                                        (format "%s continue" operation) 'resume)
+          (neo-git--mutate (list operation action)
+                           (format "%s %s" operation (substring action 2)) nil 'resume))))))
 
 (defun neo-git-stash-save ()
   "Save changes, optionally including untracked files."
@@ -2517,7 +2871,9 @@ Resolve conflicts and stage the files before continuing."
                      ("B" . neo-git-create-branch) ("s" . neo-git-stash-save)
                      ("S" . neo-git-stash) ("3" . neo-git-branch-list)
                      ("4" . neo-git-history) ("5" . neo-git-stash-list)
-                     ("m" . neo-git-merge) ("M" . neo-git-rebase) ("A" . neo-git-continue)))
+                     ("m" . neo-git-merge) ("M" . neo-git-rebase-menu) ("A" . neo-git-continue)
+                     ("C" . neo-git-commit-menu) ("z" . neo-git-recovery-menu)
+                     ("E" . neo-git-resolve-conflict)))
     (define-key map (kbd (car binding)) (cdr binding))))
 (with-eval-after-load 'evil
   (dolist (map (list neo-git-mode-map neo-git-diff-mode-map))
@@ -2526,7 +2882,17 @@ Resolve conflicts and stage the files before continuing."
       (kbd "B") #'neo-git-create-branch (kbd "s") #'neo-git-stash-save
       (kbd "S") #'neo-git-stash (kbd "3") #'neo-git-branch-list
       (kbd "4") #'neo-git-history (kbd "5") #'neo-git-stash-list
-      (kbd "m") #'neo-git-merge (kbd "M") #'neo-git-rebase (kbd "A") #'neo-git-continue)))
+      (kbd "m") #'neo-git-merge (kbd "M") #'neo-git-rebase-menu (kbd "A") #'neo-git-continue
+      (kbd "C") #'neo-git-commit-menu (kbd "z") #'neo-git-recovery-menu
+      (kbd "E") #'neo-git-resolve-conflict)))
+
+(dolist (binding '(("c" . neo-git-commit-menu) ("M" . neo-git-rebase-menu)
+                   ("z" . neo-git-recovery-menu)))
+  (define-key neo-git-browser-mode-map (kbd (car binding)) (cdr binding)))
+(with-eval-after-load 'evil
+  (evil-define-key* '(normal motion) neo-git-browser-mode-map
+    (kbd "c") #'neo-git-commit-menu (kbd "M") #'neo-git-rebase-menu
+    (kbd "z") #'neo-git-recovery-menu))
 
 (provide 'neo-git)
 ;;; neo-git.el ends here

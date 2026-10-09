@@ -38,8 +38,10 @@ Git リポジトリ内のファイルやディレクトリから `M-x neo-git-st
 | `a` | 一覧のステージ状態を全件切替／差分の行・hunk 選択を切替 |
 | `RET` / `TAB` | 差分を開く／一覧と差分を切替 |
 | `J` / `K` | 差分から前後のファイルへ移動 |
-| `e` | 選択ファイル／差分に対応する作業ファイルの行を開く |
+| `e` | 選択ファイル／差分に対応する作業ファイルの行を開く（一覧の競合ファイルはSmergeで解決） |
+| `E` | 選択した競合ファイルをSmergeで開き、最初の競合へ移動 |
 | `c` | コミットメッセージを編集 |
+| `C` | コミットメニュー：通常commit／HEADのamend／メッセージだけreword／fixup（履歴では `c`） |
 | `C-c C-c` / `C-c C-k` | コミットを確定／中止（メッセージ編集時） |
 | `f` / `p` / `P` | fetch / pull / push |
 | `r` / `R` | 更新 |
@@ -47,8 +49,9 @@ Git リポジトリ内のファイルやディレクトリから `M-x neo-git-st
 | `l` / `4` | 履歴ペインへ移動（`RET` でコミットの差分を右に表示、`a` で全ブランチ／現在のブランチ切替、`B` でそのコミットからブランチ作成、`C` で cherry-pick、`q` / `TAB` で一覧へ戻る） |
 | `b` / `B` | ブランチ切替（リモートは追跡ブランチを作成）／HEAD からブランチ作成 |
 | `3` | ブランチ一覧（`SPC` 切替、`B` そこからブランチ作成、`R` 名前変更、`d` / `D` ローカルブランチ削除／強制削除、`RET` 差分） |
-| `m` / `M` | ブランチを merge／現在のブランチを rebase |
+| `m` / `M` | ブランチをmerge／rebaseメニュー（通常・対話的・autosquash） |
 | `A` | 進行中の merge・rebase・cherry-pick を continue／abort／skip |
+| `z` | 復旧メニュー：reflog／復旧ブランチ作成／revert／reset |
 | `s` / `S` / `5` | stash 保存／stash メニュー／stash 一覧（一覧で `SPC` 適用、`d` 削除） |
 | `@` | 最近の Git コマンドとエラーを表示 |
 | `?` | キー案内 |
@@ -58,15 +61,36 @@ Git リポジトリ内のファイルやディレクトリから `M-x neo-git-st
 
 コミットの作者は対象リポジトリの Git 設定に従います。`neo-emacs` と併用する場合、`,` は既存の `neo-leader-map` に接続します。
 
+### コミット修正と競合解決
+
+amendとrewordはHEADを書き換える前に確認します。rewordはindexの内容をコミットに含めず、ステージ状態を保持します。編集中にHEADが変わった場合は、確定を拒否します。fixupは履歴で選択したHEADの祖先、または候補から選んだコミットを対象にし、あとからautosquashで取り込めます。
+
+競合ファイルでは `C-c C-n` / `C-c C-p` で次／前の競合へ移動し、`C-c C-m` / `C-c C-o` / `C-c C-b` で上側／下側／両方を採用します。`C-c C-e` はEdiffを開きます。`C-c C-c` はファイル全体に未解決マーカーがないことを確認して保存・stageし、一覧へ戻ります。`C-c C-k` は編集を保持して一覧へ戻ります。解決後、`A` で進行中の操作を継続してください。標準より長いマーカーを使うファイルは手動で編集してください（未解決のままのstageは拒否します）。削除など作業ファイルが存在しない競合は、Gitで解決してください。
+
+### 対話的rebaseと復旧
+
+`M` → `i`（対話的）または `a`（autosquash）で、書き換える範囲の手前のコミットを指定します。Gitが作成したtodoをEmacsで編集でき、通常の編集操作で行を並べ替え、`C-c C-a` で行の操作を選べます。`C-c C-c` で保存して実行、`C-c C-k` でその編集を中止します。reword／squashやrebase継続が要求するメッセージも同じキーで編集します。中途の編集中止でrebaseが残った場合は、`A` → abortで戻してください。merge構造は `--rebase-merges` で保持します。
+
+対話的編集にはEmacsに付属する `emacsclient` を使います。必要なときに、このEmacs内でserverを開始します。他のEmacsが同じserver名を使っていれば別名で開始し、既存serverを置き換えません。
+
+reflog一覧の `B` は選択コミットから復旧ブランチを作成し、現在のブランチや作業ファイルを変更しません。revertは打ち消すコミットを新規作成します。mergeコミットのrevertはmainlineの指定が必要なので、Gitから行ってください。resetはsoft／mixed／hardを選び、対象と影響を確認して実行します。
+
 ## 検証
 
 ```sh
 emacs -Q --batch -l check-package.el
 emacs -Q --batch -l check-git.el
 emacs -Q --batch -l check-git-workflows.el
+emacs -Q --batch -l check-git-advanced.el
 ```
 
 `check-package.el` は一時的な package ディレクトリへインストールし、autoload と標準ライブラリだけでの起動を確認します。`check-git.el` は一時 Git リポジトリでステージ・部分操作・commit・fetch・pull・push などを検証します。`check-git-workflows.el` は履歴グラフ・ブランチ・stash・merge・rebase・cherry-pick を検証します。`benchmark-git.el` は既存の検証が使用するプロセス計測コードです。
+
+`check-git-advanced.el` はamend、indexを保持するreword、fixup、競合解決、実際のemacsclient経由のrebase編集・中止、復旧ブランチ、reflog、resetを一時リポジトリで検証します。
+
+### GUIでのMagit比較
+
+手順と測定条件は [benchmarks/README.md](benchmarks/README.md) を参照してください。比較は通常の設定を読み込んだ別GUIプロセスで行い、使い捨てのGitリポジトリ以外のindexを変更しません。
 
 ## ライセンス
 
