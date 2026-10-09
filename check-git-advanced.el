@@ -478,4 +478,36 @@
           (kill-buffer owner)
           (should-not (buffer-live-p cached)))))))
 
+(ert-deftest neo-git-advanced-preview-hash-raw-bytes ()
+  (let* ((file (make-temp-file "neo-git-hash-"))
+         (bytes (apply #'unibyte-string (number-sequence 0 255)))
+         (expected (secure-hash 'sha256 bytes)))
+    (unwind-protect
+        (progn
+          (let ((coding-system-for-write 'no-conversion))
+            (with-temp-file file
+              (set-buffer-multibyte nil)
+              (insert bytes)))
+          (cl-letf (((symbol-function 'select-safe-coding-system-interactively)
+                     (lambda (&rest _) (error "Unexpected Select Coding prompt"))))
+            (dolist (coding '(nil utf-8-unix utf-16le-unix))
+              (let ((coding-system-for-write coding))
+                (should (equal expected (neo-git--preview-file-hash file)))))))
+      (delete-file file))))
+
+(ert-deftest neo-git-advanced-preview-hash-coding-cookie ()
+  (let* ((file (make-temp-file "neo-git-cookie-"))
+         (bytes (encode-coding-string ";;; -*- coding: utf-8 -*-\n日本語\n" 'utf-8-unix))
+         (expected (secure-hash 'sha256 bytes)))
+    (unwind-protect
+        (progn
+          (let ((coding-system-for-write 'no-conversion))
+            (with-temp-file file
+              (set-buffer-multibyte nil)
+              (insert bytes)))
+          (cl-letf (((symbol-function 'select-safe-coding-system-interactively)
+                     (lambda (&rest _) (error "Unexpected Select Coding prompt"))))
+            (should (equal expected (neo-git--preview-file-hash file)))))
+      (delete-file file))))
+
 (ert-run-tests-batch-and-exit (or (getenv "NEO_GIT_TEST") t))

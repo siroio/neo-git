@@ -856,8 +856,9 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
       (when (and (not (file-symlink-p file)) (file-regular-p file)
                  (<= (file-attribute-size (file-attributes file)) neo-git--limit))
         (with-temp-buffer
+          (set-buffer-multibyte nil)
           (insert-file-contents-literally file)
-          (secure-hash 'sha256 (current-buffer))))
+          (secure-hash 'sha256 (buffer-string))))
     (file-error nil)))
 
 (defun neo-git--preview-cache-key (path kind old-path)
