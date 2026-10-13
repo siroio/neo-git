@@ -59,6 +59,7 @@
 (defvar-local neo-git-root nil)
 (defvar-local neo-git-state nil)
 (defvar-local neo-git-entries nil)
+(defvar-local neo-git--status-error nil)
 (defvar-local neo-git--refresh-process nil)
 (defvar-local neo-git--refresh-timer nil)
 (defvar-local neo-git--refresh-pending nil)
@@ -207,6 +208,11 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
           (let ((process-environment
                  (cons (concat "GIT_EDITOR=" (or neo-git--interactive-editor "true"))
                        process-environment)))
+            ;; A deleted .git must not redirect queries into a parent repository.
+            (when (and neo-git-root (equal (expand-file-name directory) neo-git-root))
+              (setenv "GIT_CEILING_DIRECTORIES"
+                      (directory-file-name
+                       (file-name-directory (directory-file-name neo-git-root)))))
             ;; Ordinary operations keep Git's prepared message. Interactive
             ;; operations explicitly route editing back into this Emacs.
             (setq process
@@ -586,7 +592,8 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
     (erase-buffer)
     (insert (format "Neo Git  %s  " (or neo-git-root "")))
     (let ((branch-start (point)))
-      (insert (or (plist-get neo-git-state :branch) "detached/unborn"))
+      (insert (if neo-git--status-error "unavailable"
+                (or (plist-get neo-git-state :branch) "detached/unborn")))
       (add-text-properties branch-start (point) '(face neo-git-branch-face)))
     (insert (if (plist-get neo-git-state :upstream)
                 (concat " → " (plist-get neo-git-state :upstream)) ""))
@@ -651,9 +658,10 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
                          (eq (plist-get old :kind) (plist-get entry :kind)))
                 (setq target start)))))))
     (if (null positions)
-        (insert (if neo-git--narrow
-                    "No matching paths\n"
-                  "Working tree clean\n"))
+        (insert (cond (neo-git--status-error
+                       (format "Status unavailable: %s\nPress r to retry.\n" neo-git--status-error))
+                      (neo-git--narrow "No matching paths\n")
+                      (t "Working tree clean\n")))
       (goto-char (or target same-kind-target work-target empty-group-target nearest)))
     (when (and (null positions) empty-group-target)
       (goto-char empty-group-target))
@@ -692,11 +700,14 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
                   (head (lambda (s) (mapcar (lambda (k) (plist-get s k))
                                             '(:oid :branch :upstream :ahead :behind)))))
               ;; Commit, pull, push, fetch and branch switches all move one of these.
-              (when (and neo-git-state
-                         (not (equal (funcall head neo-git-state) (funcall head state))))
-                (neo-git--refresh-browsers buffer 'history))
+              (if neo-git--status-error
+                  (neo-git--refresh-browsers buffer)
+                (when (and neo-git-state
+                           (not (equal (funcall head neo-git-state) (funcall head state))))
+                  (neo-git--refresh-browsers buffer 'history)))
               (setq neo-git-state state
-                    neo-git-entries (plist-get state :entries))
+                    neo-git-entries (plist-get state :entries)
+                    neo-git--status-error nil)
               (neo-git--render (and id (list :path (car id) :kind (cadr id))))
               (if (and prefetch
                        (eq prefetch neo-git--stage-prefetch)
@@ -710,12 +721,18 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
                 (when (eq prefetch neo-git--stage-prefetch)
                   (neo-git--invalidate-stage-prefetch))
                 (neo-git--preview-selected)))
-          (message "Neo Git status failed: %s"
-                   (if (string-empty-p (string-trim error-output))
-                       (format "Git exited with status %s" status)
-                     (string-trim error-output)))
           (when (eq prefetch neo-git--stage-prefetch)
-            (neo-git--invalidate-stage-prefetch)))))))
+            (neo-git--invalidate-stage-prefetch))
+          (setq neo-git-state nil
+                neo-git-entries nil
+                neo-git--status-error
+                (if (string-empty-p (string-trim error-output))
+                    (format "Git exited with status %s" status)
+                  (string-trim error-output)))
+          (neo-git--render)
+          (neo-git--preview-selected)
+          (neo-git--refresh-browsers buffer)
+          (message "Neo Git status failed: %s" neo-git--status-error))))))
 
 (defun neo-git--refresh-now (buffer &optional prefetch)
   (when (and (buffer-live-p buffer)
@@ -2747,8 +2764,11 @@ One row per commit: ● commit, ○ merge, <─┐ merged branch, ─┘ fork po
                  (when (= generation neo-git--browser-generation)
                    (setq neo-git--browser-process nil)
                    (if (not (eq status 0))
-                       (setq header-line-format
-                             (neo-git--mode-line-literal (concat " " errors)))
+                       (progn
+                         (setq tabulated-list-entries nil
+                               header-line-format
+                               (neo-git--mode-line-literal (concat " " errors)))
+                         (tabulated-list-print t))
                      (setq tabulated-list-entries
                            (pcase neo-git--browser-kind
                              ('history (neo-git--history-entries output))

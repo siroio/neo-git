@@ -86,11 +86,14 @@ emacs -Q --batch -l check-package.el
 emacs -Q --batch -l check-git.el
 emacs -Q --batch -l check-git-workflows.el
 emacs -Q --batch -l check-git-advanced.el
+emacs -Q --batch -l check-refresh.el
 ```
 
 `check-package.el` は一時的な package ディレクトリへインストールし、autoload と標準ライブラリだけでの起動を確認します。`check-git.el` は一時 Git リポジトリでステージ・部分操作・commit・fetch・pull・push などを検証します。`check-git-workflows.el` は履歴グラフ・ブランチ・stash・merge・rebase・cherry-pick を検証します。`benchmark-git.el` は既存の検証が使用するプロセス計測コードです。
 
 `check-git-advanced.el` はamend、indexを保持するreword、fixup、競合解決、実際のemacsclient経由のrebase編集・中止、復旧ブランチ、reflog、resetを一時リポジトリで検証します。
+
+`check-refresh.el` はリポジトリ本体・`.git`削除後の更新で古い一覧・差分・履歴が消え、再作成後に更新できることを検証します。状態取得に失敗した画面にはエラーを表示し、`r`で再試行できます。
 
 ### GUIでのMagit比較
 
