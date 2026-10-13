@@ -285,7 +285,7 @@
             (let (rejected)
               (cl-letf (((symbol-function 'tabulated-list-get-id)
                          (lambda (&rest _) "refs/remotes/origin/main")))
-                (condition-case nil (neo-git-browser-delete) (user-error (setq rejected t))))
+                (condition-case nil (neo-git-branch-force-delete) (user-error (setq rejected t))))
               (cl-assert rejected)))
           (cl-assert (string-empty-p (neo-git-workflow-output root "branch" "--list" "renamed" "topic")))
           (neo-git-workflow-wait

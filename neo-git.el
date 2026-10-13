@@ -2523,7 +2523,7 @@ C-c C-c saves and continues; C-c C-k cancels this editor invocation."
   "Browse commits, branches or stash entries. RET: diff; r: refresh; q: return.
 In history, a: toggle all branches; B: branch here; C: cherry-pick.
 In branch lists, SPC: switch (remote: tracking branch); B: branch from it;
-R: rename; d/D: delete/force delete.
+R: rename local; d: delete local/remote; D: force delete local.
 In stash lists, SPC: apply without deleting; d: delete with confirmation."
   (setq-local truncate-lines t)
   (when (fboundp 'evil-define-key*)
@@ -2787,7 +2787,7 @@ One row per commit: ● commit, ○ merge, <─┐ merged branch, ─┘ fork po
                            (if tabulated-list-entries
                                (pcase neo-git--browser-kind
                                  ('stash " SPC: apply (keep stash)  RET: diff  d: delete  r: refresh  q: back")
-                                 ('branches " SPC: switch  B: new from  R: rename  d/D: delete  RET: diff  q: back")
+                                 ('branches " SPC: switch  B: new from  R: rename local  d: delete  D: force local  RET: diff  q: back")
                                  ('reflog " Reflog: RET: diff  B: recovery branch  z: recovery menu  q: back")
                                  (_ (concat (if neo-git--history-all " All branches" " Current branch")
                                             ", latest 100  RET: diff  a: all/current  B: branch here"
@@ -2916,11 +2916,39 @@ One row per commit: ● commit, ○ merge, <─┐ merged branch, ─┘ fork po
         (neo-git--mutate (list "branch" (if force "-D" "-d") branch)
                          (concat "delete " branch))))))
 
+(defun neo-git--remote-branch-delete (ref)
+  "Delete REF on its configured remote, protecting updates since the last fetch."
+  (let* ((remote (seq-find
+                  (lambda (name) (string-prefix-p (concat "refs/remotes/" name "/") ref))
+                  (process-lines (neo-git--executable) "-C" neo-git-root "remote")))
+         (branch (and remote (substring ref (length (concat "refs/remotes/" remote "/")))))
+         (target (and branch (concat "refs/heads/" branch))))
+    (unless remote (user-error "No configured remote matches this branch"))
+    ;; Only the conventional fetch mapping unambiguously names a server branch.
+    (unless (equal (list (concat "+refs/heads/*:refs/remotes/" remote "/*"))
+                    (process-lines (neo-git--executable) "-C" neo-git-root
+                                   "config" "--get-all" (concat "remote." remote ".fetch")))
+      (user-error "Remote deletion requires the standard branch fetch mapping"))
+    (when (zerop (process-file (neo-git--executable) nil nil nil "-C" neo-git-root
+                              "symbolic-ref" "-q" ref))
+      (user-error "Cannot delete a symbolic remote reference"))
+    (let ((oid (car (process-lines (neo-git--executable) "-C" neo-git-root
+                                  "rev-parse" "--verify" ref))))
+      (when (yes-or-no-p (format "Delete remote branch %s/%s from the server? " remote branch))
+        (with-current-buffer (neo-git--status-owner)
+          (neo-git--mutate (list "push" "--progress"
+                                 (concat "--force-with-lease=" target ":" oid)
+                                 "--delete" "--" remote target)
+                           (format "delete remote %s/%s" remote branch)))))))
+
 (defun neo-git-browser-delete ()
-  "Delete the local branch row (merged only), or the stash row."
+  "Delete a local (merged only) or remote branch row, or the stash row."
   (interactive)
   (if (eq neo-git--browser-kind 'branches)
-      (neo-git--branch-delete nil)
+      (let ((ref (neo-git--branch-at-point)))
+        (if (string-prefix-p "refs/remotes/" ref)
+            (neo-git--remote-branch-delete ref)
+          (neo-git--branch-delete nil)))
     (neo-git-stash-drop)))
 
 (defun neo-git-branch-force-delete ()

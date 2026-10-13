@@ -48,7 +48,7 @@ Git リポジトリ内のファイルやディレクトリから `M-x neo-git-st
 | `/` | パス検索 |
 | `l` / `4` | 履歴ペインへ移動（`RET` でコミットの差分を右に表示、`a` で全ブランチ／現在のブランチ切替、`B` でそのコミットからブランチ作成、`C` で cherry-pick、`q` / `TAB` で一覧へ戻る） |
 | `b` / `B` | ブランチ切替（リモートは追跡ブランチを作成）／HEAD からブランチ作成 |
-| `3` | ブランチ一覧（`SPC` 切替、`B` そこからブランチ作成、`R` 名前変更、`d` / `D` ローカルブランチ削除／強制削除、`RET` 差分） |
+| `3` | ブランチ一覧（`SPC` 切替、`B` そこからブランチ作成、`R` ローカルの名前変更、`d` ローカル／リモートブランチ削除、`D` ローカルの強制削除、`RET` 差分） |
 | `m` / `M` | ブランチをmerge／rebaseメニュー（通常・対話的・autosquash） |
 | `A` | 進行中の merge・rebase・cherry-pick を continue／abort／skip |
 | `z` | 復旧メニュー：reflog／復旧ブランチ作成／revert／reset |
@@ -64,6 +64,8 @@ Git リポジトリ内のファイルやディレクトリから `M-x neo-git-st
 履歴はハッシュ・Author・グラフ・日付・件名の順で表示します。Authorは16文字幅で作者ごとに色分けし、マウスを重ねるとフルネームを確認できます。
 
 コミットの作者は対象リポジトリの Git 設定に従います。`neo-emacs` と併用する場合、`,` は既存の `neo-leader-map` に接続します。
+
+リモートブランチの`d`は、確認後にサーバー側のブランチを削除します。同名のローカルブランチは残ります。最後のfetchからリモート側で更新されていた場合は削除を拒否するため、fetchして内容を確認してから再試行してください。標準のfetch設定（`+refs/heads/*:refs/remotes/<remote>/*`）に対応します。
 
 ### コミット修正と競合解決
 
@@ -87,6 +89,7 @@ emacs -Q --batch -l check-git.el
 emacs -Q --batch -l check-git-workflows.el
 emacs -Q --batch -l check-git-advanced.el
 emacs -Q --batch -l check-refresh.el
+emacs -Q --batch -l check-remote-delete.el
 ```
 
 `check-package.el` は一時的な package ディレクトリへインストールし、autoload と標準ライブラリだけでの起動を確認します。`check-git.el` は一時 Git リポジトリでステージ・部分操作・commit・fetch・pull・push などを検証します。`check-git-workflows.el` は履歴グラフ・ブランチ・stash・merge・rebase・cherry-pick を検証します。`benchmark-git.el` は既存の検証が使用するプロセス計測コードです。
@@ -94,6 +97,8 @@ emacs -Q --batch -l check-refresh.el
 `check-git-advanced.el` はamend、indexを保持するreword、fixup、競合解決、実際のemacsclient経由のrebase編集・中止、復旧ブランチ、reflog、resetを一時リポジトリで検証します。
 
 `check-refresh.el` はリポジトリ本体・`.git`削除後の更新で古い一覧・差分・履歴が消え、再作成後に更新できることを検証します。状態取得に失敗した画面にはエラーを表示し、`r`で再試行できます。
+
+`check-remote-delete.el` は一時bare remoteで削除確認・取消、他者による更新時の拒否、削除後の一覧更新、同名ローカルブランチの保持を検証します。
 
 ### GUIでのMagit比較
 
