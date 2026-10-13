@@ -2585,8 +2585,9 @@ RESUME permits a merge/rebase in progress, for continuing or aborting it."
             tabulated-list-format
             (pcase kind
               ;; Unsortable: sorting would scramble the graph.
-              ('history (vector (list "Graph" 1 nil) (list "Commit" 8 nil)
-                                (list "Date" 11 nil) (list "Subject" 0 nil)))
+              ('history (vector (list "Commit" 8 nil) (list "Author" 16 nil)
+                                (list "Graph" 1 nil) (list "Date" 11 nil)
+                                (list "Subject" 0 nil)))
               ('branches [("" 1 nil) ("Branch" 32 nil) ("Upstream" 28 nil)
                           ("Date" 11 nil) ("Subject" 0 nil)])
               ('reflog [("Reflog" 20 nil) ("Operation" 0 nil)])
@@ -2633,7 +2634,7 @@ One row per commit: ● commit, ○ merge, <─┐ merged branch, ─┘ fork po
                 (lane (oid) (cl-position oid lanes :key #'car-safe :test #'equal)))
       (dolist (line (split-string output "
 " t))
-        (pcase-let* ((`(,oid ,parents ,hash ,date ,refs . ,subject) (split-string line ""))
+        (pcase-let* ((`(,oid ,parents ,hash ,date ,author ,refs . ,subject) (split-string line ""))
                      (parents (split-string parents " " t))
                      (above (copy-sequence lanes))
                      (col (or (lane oid) (alloc oid)))
@@ -2671,8 +2672,12 @@ One row per commit: ● commit, ○ merge, <─┐ merged branch, ─┘ fork po
                          nil))
               (aset cells (* 2 col) (cons (if (cdr parents) ?○ ?●) color)))
             (push (list oid
-                        (vector (neo-git--graph-string cells)
-                                (propertize hash 'face 'font-lock-comment-face)
+                        (vector (propertize hash 'face 'font-lock-comment-face)
+                                (propertize author 'help-echo author
+                                            'face `(:foreground ,(nth (mod (sxhash author)
+                                                                          (length neo-git--graph-colors))
+                                                                     neo-git--graph-colors)))
+                                (neo-git--graph-string cells)
                                 date
                                 (concat (unless (string-empty-p refs)
                                           (propertize (format "(%s) " refs) 'face 'neo-git-ref-face))
@@ -2681,8 +2686,8 @@ One row per commit: ● commit, ○ merge, <─┐ merged branch, ─┘ fork po
           (while (and lanes (null (car (last lanes))))
             (setq lanes (butlast lanes))))))
     (setq rows (nreverse rows))
-    (setf (cadr (aref tabulated-list-format 0))
-          (apply #'max 1 (mapcar (lambda (row) (string-width (aref (cadr row) 0))) rows)))
+    (setf (cadr (aref tabulated-list-format 2))
+          (apply #'max 1 (mapcar (lambda (row) (string-width (aref (cadr row) 2))) rows)))
     rows))
 
 (defun neo-git-history ()
@@ -2731,7 +2736,7 @@ One row per commit: ● commit, ○ merge, <─┐ merged branch, ─┘ fork po
            neo-git-root
            (pcase neo-git--browser-kind
              ('history (append '("log" "--topo-order" "-100" "--date=short" "--color=never"
-                                 "--format=%H%x1f%P%x1f%h%x1f%ad%x1f%D%x1f%s")
+                                 "--format=%H%x1f%P%x1f%h%x1f%ad%x1f%an%x1f%D%x1f%s")
                                (when neo-git--history-all '("--branches" "--remotes" "--tags"))))
              ('branches (cons "for-each-ref" neo-git--branch-format))
              ('reflog '("reflog" "-100" "--format=%H%x09%gd%x09%gs"))

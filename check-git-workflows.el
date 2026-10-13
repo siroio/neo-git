@@ -33,7 +33,8 @@
         (neo-git-workflow-output root "config" "user.email" "check@example.invalid")
         (with-temp-file "file.txt" (insert "baseline\n"))
         (neo-git-workflow-output root "add" "file.txt")
-        (neo-git-workflow-output root "commit" "-qm" "initial 日本語")
+        (neo-git-workflow-output root "commit" "--author=作者 テスト <author@example.invalid>"
+                                 "-qm" "initial 日本語")
         (neo-git-workflow-output root "switch" "-qc" "side")
         (with-temp-file "side.txt" (insert "side\n"))
         (neo-git-workflow-output root "add" "side.txt")
@@ -51,11 +52,18 @@
         (with-current-buffer history
           (goto-char (point-min))
           (cl-assert (string-match-p "initial 日本語" (buffer-string)))
+          (let* ((initial (car (last tabulated-list-entries)))
+                 (columns (cadr initial)))
+            (cl-assert (equal "Author" (car (aref tabulated-list-format 1))))
+            (cl-assert (equal "作者 テスト" (aref columns 1)))
+            (cl-assert (get-text-property 0 'face (aref columns 1)))
+            (cl-assert (equal "作者 テスト" (get-text-property 0 'help-echo (aref columns 1))))
+            (cl-assert (string-match-p "^[0-9]" (aref columns 3))))
           ;; One row per commit: a hollow merge node pulls in the side lane,
           ;; which forks off the initial commit.
-          (cl-assert (string-match-p "^ *○<┐.*(HEAD -> main) merge side" (buffer-string)))
-          (cl-assert (string-match-p "^ *│ ●.*side work" (buffer-string)))
-          (cl-assert (string-match-p "^ *●─┘.*initial" (buffer-string)))
+          (cl-assert (string-match-p "^.*○<┐.*(HEAD -> main) merge side" (buffer-string)))
+          (cl-assert (string-match-p "^.*│ ●.*side work" (buffer-string)))
+          (cl-assert (string-match-p "^.*●─┘.*initial" (buffer-string)))
           (cl-assert (= 3 (length tabulated-list-entries)))
           (cl-assert (seq-every-p #'car tabulated-list-entries))
           (goto-char (point-max))
