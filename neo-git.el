@@ -363,6 +363,8 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
   "Major mode for the Neo Git status interface."
   (setq-local truncate-lines t)
   (setq-local header-line-format '(:eval (neo-git--status-header-line)))
+  (add-hook 'pre-command-hook #'neo-git--remember-point nil t)
+  (add-hook 'post-command-hook #'neo-git--normalize-point nil t)
   (add-hook 'kill-buffer-hook #'neo-git--progress-stop nil t)
   (add-hook 'kill-buffer-hook (lambda () (neo-git--clear-preview-cache t)) nil t)
   (setq-local hl-line-sticky-flag t)
@@ -435,6 +437,37 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
                     (kbd "SPC") #'neo-git--owner-stage (kbd "d") #'neo-git-discard))
 
 ;;; Selection and pane command routing
+
+(defvar-local neo-git--point-before-command nil)
+
+(defun neo-git--remember-point ()
+  (setq neo-git--point-before-command (point)))
+
+(defun neo-git--normalize-point ()
+  "Keep list navigation on selectable rows and update the status preview."
+  ;; Do not displace an empty group retained by a status refresh unless the
+  ;; user moves.  Diff buffers have their own line and hunk navigation.
+  (when (and neo-git--point-before-command
+             (/= (point) neo-git--point-before-command))
+    (let* ((property (if (derived-mode-p 'neo-git-mode)
+                         'neo-git-entry 'tabulated-list-id))
+           (direction (if (> (point) neo-git--point-before-command) 1 -1))
+           (origin (point))
+           target)
+      (unless (get-text-property (line-beginning-position) property)
+        (dolist (step (list direction (- direction)))
+          (unless target
+            (save-excursion
+              (goto-char origin)
+              (while (and (not (get-text-property (line-beginning-position) property))
+                          (zerop (forward-line step))))
+              (when (get-text-property (line-beginning-position) property)
+                (setq target (line-beginning-position))))))
+        (when target (goto-char target)))
+      (when (derived-mode-p 'neo-git-mode)
+        (neo-git--sync-window-point)
+        (unless (equal (neo-git--selected-id) neo-git--current-selection)
+          (neo-git--preview-selected))))))
 
 (defun neo-git--entry-at-point ()
   (get-text-property (line-beginning-position) 'neo-git-entry))
@@ -1040,18 +1073,20 @@ and index changes between refreshes, including edits with unchanged mtime."
 (defun neo-git-next ()
   (interactive)
   (let* ((rows (neo-git--row-positions))
-         (index (cl-position (line-beginning-position) rows :test #'=)))
+         (line (line-beginning-position)))
     (when rows
-      (goto-char (nth (min (1- (length rows)) (1+ (or index -1))) rows))
+      (goto-char (or (cl-find-if (lambda (row) (> row line)) rows)
+                     (car (last rows))))
       (neo-git--sync-window-point)
       (neo-git--preview-selected))))
 
 (defun neo-git-previous ()
   (interactive)
   (let* ((rows (neo-git--row-positions))
-         (index (cl-position (line-beginning-position) rows :test #'=)))
+         (line (line-beginning-position)))
     (when rows
-      (goto-char (nth (max 0 (1- (or index 0))) rows))
+      (goto-char (or (cl-find-if (lambda (row) (< row line)) (reverse rows))
+                     (car rows)))
       (neo-git--sync-window-point)
       (neo-git--preview-selected))))
 
@@ -2526,6 +2561,8 @@ In branch lists, SPC: switch (remote: tracking branch); B: branch from it;
 R: rename local; d: delete local/remote; D: force delete local.
 In stash lists, SPC: apply without deleting; d: delete with confirmation."
   (setq-local truncate-lines t)
+  (add-hook 'pre-command-hook #'neo-git--remember-point nil t)
+  (add-hook 'post-command-hook #'neo-git--normalize-point nil t)
   (when (fboundp 'evil-define-key*)
     (evil-define-key* '(normal motion) neo-git-browser-mode-map
       (kbd "RET") #'neo-git-browser-show (kbd "r") #'neo-git-browser-refresh

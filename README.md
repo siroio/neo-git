@@ -89,6 +89,7 @@ emacs -Q --batch -l check-git.el
 emacs -Q --batch -l check-git-workflows.el
 emacs -Q --batch -l check-git-advanced.el
 emacs -Q --batch -l check-refresh.el
+emacs -Q --batch -l check-navigation.el
 emacs -Q --batch -l check-remote-delete.el
 ```
 
@@ -97,6 +98,8 @@ emacs -Q --batch -l check-remote-delete.el
 `check-git-advanced.el` はamend、indexを保持するreword、fixup、競合解決、実際のemacsclient経由のrebase編集・中止、復旧ブランチ、reflog、resetを一時リポジトリで検証します。
 
 `check-refresh.el` はリポジトリ本体・`.git`削除後の更新で古い一覧・差分・履歴が消え、再作成後に更新できることを検証します。状態取得に失敗した画面にはエラーを表示し、`r`で再試行できます。
+
+`check-navigation.el` は一覧の上下端・見出しを越える移動と差分の追従を検証します。Evilを先にロードして実行すると、`Ctrl+D` / `Ctrl+U`の連続入力も検証します。
 
 `check-remote-delete.el` は一時bare remoteで削除確認・取消、他者による更新時の拒否、削除後の一覧更新、同名ローカルブランチの保持を検証します。
 
