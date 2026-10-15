@@ -89,6 +89,7 @@
 (defvar-local neo-git--current-selection nil)
 (defvar-local neo-git--visual-inclusive nil)
 (defvar-local neo-git--closed nil)
+(defvar-local neo-git--close-pending nil)
 (defvar-local neo-git--diff-owner nil)
 (defvar-local neo-git--diff-source nil)
 (defvar-local neo-git--diff-id nil)
@@ -164,7 +165,9 @@
 (defun neo-git--run (directory arguments callback &optional limit stdin)
   "Run Git in DIRECTORY with ARGUMENTS, then call CALLBACK with status/stdout/stderr.
 LIMIT bounds captured stdout; exceeding it reports `output-limit'."
-  (let ((out (generate-new-buffer " *neo-git-out*"))
+  (let ((source (current-buffer))
+        (owner (or (neo-git--owner-buffer) (current-buffer)))
+        (out (generate-new-buffer " *neo-git-out*"))
         (err (generate-new-buffer " *neo-git-err*"))
         (max-output (or limit (* 16 neo-git--limit)))
         (log-entry (neo-git--log-start directory arguments))
@@ -178,6 +181,14 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
          (dispose-buffers ()
            (when (buffer-live-p out) (kill-buffer out))
            (when (buffer-live-p err) (kill-buffer err)))
+         (invoke-callback (status stdout stderr)
+           (unwind-protect
+               (funcall callback status stdout stderr)
+             (when process (process-put process 'neo-git-finished t))
+             (neo-git--finish-close
+              (or (and process (process-get process 'neo-git-source)) source))
+             (neo-git--finish-close
+              (or (and process (process-get process 'neo-git-owner)) owner))))
          (finish (status)
            (unless finished
              (setq finished t)
@@ -185,7 +196,7 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
                    (stderr (contents err)))
                (neo-git--log-finish log-entry status stdout stderr)
                (dispose-buffers)
-               (funcall callback status stdout stderr))))
+               (invoke-callback status stdout stderr))))
          (sentinel (proc _event)
            (when (memq (process-status proc) '(exit signal))
              (finish (if (process-get proc 'neo-git-too-large)
@@ -232,6 +243,10 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
             (set-process-coding-system process 'utf-8-unix 'utf-8-unix)
             (process-put process 'neo-git-stderr-buffer err)
             (process-put process 'neo-git-log-entry log-entry)
+            (process-put process 'neo-git-source source)
+            (process-put process 'neo-git-owner owner)
+            (add-hook 'kill-buffer-query-functions #'neo-git--can-kill nil t)
+            (add-hook 'kill-buffer-hook #'neo-git--stop-processes t t)
             (when stdin
               (process-send-string process stdin)
               (process-send-eof process))
@@ -245,7 +260,7 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
                  (stderr (contents err)))
              (neo-git--log-finish log-entry failure stdout stderr)
              (dispose-buffers)
-             (funcall callback failure stdout
+             (invoke-callback failure stdout
                       (if (string-empty-p stderr)
                           (error-message-string failure)
                         stderr))))
@@ -365,8 +380,8 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
   (setq-local header-line-format '(:eval (neo-git--status-header-line)))
   (add-hook 'pre-command-hook #'neo-git--remember-point nil t)
   (add-hook 'post-command-hook #'neo-git--normalize-point nil t)
-  (add-hook 'kill-buffer-hook #'neo-git--progress-stop nil t)
-  (add-hook 'kill-buffer-hook (lambda () (neo-git--clear-preview-cache t)) nil t)
+  (add-hook 'kill-buffer-hook #'neo-git--cleanup nil t)
+  (add-hook 'kill-buffer-query-functions #'neo-git--can-kill nil t)
   (setq-local hl-line-sticky-flag t)
   (hl-line-mode 1)
   (when (fboundp 'evil-define-key*)
@@ -808,6 +823,8 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
                        (message "Neo Git: %s" error-output)
                      (let ((buffer (get-buffer-create (format "*Neo Git: %s*" (directory-file-name root)))))
                        (with-current-buffer buffer
+                         (when neo-git--close-pending
+                           (user-error "Git is still running; wait for it to finish before reopening"))
                          (unless (derived-mode-p 'neo-git-mode)
                            (neo-git-mode))
                          (setq neo-git-root root)
@@ -1283,14 +1300,14 @@ C-c C-n/p move; C-c C-m/o/b keep upper/lower/both; C-c C-e opens Ediff."
 (defvar neo-git-log-mode-map
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map special-mode-map)
-    (define-key map (kbd "q") #'quit-window)
-    (define-key map (kbd "<escape>") #'quit-window)
+    (define-key map (kbd "q") #'neo-git--quit-window)
+    (define-key map (kbd "<escape>") #'neo-git--quit-window)
     map))
 
 (with-eval-after-load 'evil
   (evil-define-key* '(normal motion) neo-git-log-mode-map
-                    (kbd "q") #'quit-window
-                    (kbd "<escape>") #'quit-window))
+                    (kbd "q") #'neo-git--quit-window
+                    (kbd "<escape>") #'neo-git--quit-window))
 
 (defun neo-git-open-log ()
   "Display the bounded command and error log for this repository."
@@ -1320,6 +1337,7 @@ C-c C-n/p move; C-c C-m/o/b keep upper/lower/both; C-c C-e opens Ediff."
                   (insert "\n")))
             (insert "No Git commands recorded yet.\n"))
           (special-mode)
+          (setq-local neo-git--diff-owner owner)
           (use-local-map neo-git-log-mode-map)))
       (pop-to-buffer buffer))))
 
@@ -1333,6 +1351,8 @@ C-c C-n/p move; C-c C-m/o/b keep upper/lower/both; C-c C-e opens Ediff."
         (run-at-time 0.1 0.1 #'neo-git--progress-tick (current-buffer))))
 
 (defun neo-git--progress-set-process (process)
+  (process-put process 'neo-git-owner (current-buffer))
+  (process-put process 'neo-git-write t)
   (setq neo-git--mutation-process process))
 
 (defun neo-git--progress-stop ()
@@ -1745,7 +1765,8 @@ With DISCARD, revert the selected unstaged lines/hunks in the worktree."
                   (let ((valid
                          (and (buffer-live-p owner)
                               (buffer-live-p preview)
-                              (not (buffer-local-value 'neo-git--closed owner))
+                              (or (not (buffer-local-value 'neo-git--closed owner))
+                                  (buffer-local-value 'neo-git--close-pending owner))
                               (eq token (buffer-local-value 'neo-git--partial-operation owner))
                               (= generation (buffer-local-value 'neo-git--diff-generation owner))
                               (= refresh-generation
@@ -1855,11 +1876,43 @@ With DISCARD, revert the selected unstaged lines/hunks in the worktree."
 
 ;;; Closing and search
 
-(defun neo-git-quit ()
-  (interactive)
-  (let ((owner (current-buffer))
-        (preview neo-git--preview-buffer)
-        (preview-window neo-git--preview-window))
+(defun neo-git--buffer-processes ()
+  "Return asynchronous Git commands belonging to the current buffer."
+  (seq-filter
+   (lambda (process)
+     (or (eq (process-get process 'neo-git-source) (current-buffer))
+         (eq (process-get process 'neo-git-owner) (current-buffer))))
+   (process-list)))
+
+(defun neo-git--can-kill ()
+  "Defer buffer disposal until its Git writes and callbacks finish."
+  (if (seq-some (lambda (process)
+                  (and (process-get process 'neo-git-write)
+                       (not (process-get process 'neo-git-finished))))
+                (neo-git--buffer-processes))
+      (progn
+        (setq neo-git--close-pending t)
+        (when (derived-mode-p 'neo-git-mode) (setq neo-git--closed t))
+        (message "Neo Git: waiting for the running operation before closing")
+        nil)
+    t))
+
+(defun neo-git--finish-close (buffer)
+  "Dispose BUFFER after a deferred close request, once its writes finish."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when neo-git--close-pending (kill-buffer buffer)))))
+
+(defun neo-git--stop-processes ()
+  "Stop this buffer's read queries, leaving Git writes to finish."
+  (dolist (process (neo-git--buffer-processes))
+    (when (and (not (process-get process 'neo-git-write))
+               (process-live-p process))
+      (delete-process process))))
+
+(defun neo-git--cleanup ()
+  "Release this status buffer's processes, timers and owned buffers."
+  (let ((owner (current-buffer)))
     (setq neo-git--closed t)
     (cl-incf neo-git--refresh-generation)
     (cl-incf neo-git--diff-generation)
@@ -1869,36 +1922,40 @@ With DISCARD, revert the selected unstaged lines/hunks in the worktree."
           neo-git--status-updating nil)
     (neo-git--progress-stop)
     (setq neo-git--refresh-pending nil)
-    (when (process-live-p neo-git--refresh-process)
-      (delete-process neo-git--refresh-process))
-    (setq neo-git--refresh-process nil)
-    (when (process-live-p neo-git--attributes-process)
-      (delete-process neo-git--attributes-process))
-    (setq neo-git--attributes-process nil)
-    (neo-git--clear-preview-cache)
-    (when (process-live-p neo-git--diff-process)
-      (delete-process neo-git--diff-process))
-    (setq neo-git--diff-process nil)
+    (neo-git--stop-processes)
+    (setq neo-git--refresh-process nil
+          neo-git--attributes-process nil
+          neo-git--diff-process nil)
     (neo-git--invalidate-stage-prefetch)
+    (neo-git--clear-preview-cache t)
+    (dolist (buffer (buffer-list))
+      (when (or (eq (buffer-local-value 'neo-git--diff-owner buffer) owner)
+                (eq (buffer-local-value 'neo-git--commit-status-buffer buffer) owner))
+        (kill-buffer buffer)))
     (setq neo-git--preview-window nil
-          neo-git--history-window nil)
-    (if (window-configuration-p neo-git--window-config)
-        (progn
-          (set-window-configuration (prog1 neo-git--window-config
-                                      (setq neo-git--window-config nil)))
-          (bury-buffer owner))
+          neo-git--history-window nil)))
+
+(defun neo-git--quit-window ()
+  "Close the current auxiliary window and dispose its buffer."
+  (interactive)
+  (quit-window t))
+
+(defun neo-git-quit ()
+  "Close the Git session and dispose its buffers and running commands."
+  (interactive)
+  (let ((owner (current-buffer))
+        (preview neo-git--preview-buffer)
+        (preview-window neo-git--preview-window)
+        (configuration neo-git--window-config))
+    (if (window-configuration-p configuration)
+        (set-window-configuration configuration)
       (when (and (window-live-p preview-window)
                  (eq (window-buffer preview-window) preview)
                  (> (length (window-list nil 'no-minibuffer)) 1))
         (delete-window preview-window))
       (quit-window))
-    ;; In a narrow layout the preview replaced the list in one window.  Its
-    ;; window history can therefore make quit-window select that preview again.
-    (when (and (buffer-live-p preview) (eq (current-buffer) preview))
-      (bury-buffer preview)
-      (when (buffer-live-p owner)
-        (bury-buffer owner))
-      (switch-to-buffer (other-buffer preview t)))))
+    (kill-buffer owner)
+    (set-buffer (window-buffer (selected-window)))))
 
 (defun neo-git-search ()
   (interactive)
@@ -1935,9 +1992,12 @@ With DISCARD, revert the selected unstaged lines/hunks in the worktree."
                                (setq neo-git--mutation nil
                                      neo-git--mutation-label nil)
                                (neo-git--progress-stop)
-                               (when worktree (neo-git--revert-worktree-buffers))
-                               (when (or worktree (member (car arguments)
-                                                          '("stash" "branch" "fetch" "pull" "push")))
+                               (when (and worktree (or (not neo-git--closed)
+                                                       neo-git--close-pending))
+                                 (neo-git--revert-worktree-buffers))
+                               (when (and (not neo-git--closed)
+                                          (or worktree (member (car arguments)
+                                                              '("stash" "branch" "fetch" "pull" "push"))))
                                  (neo-git--refresh-browsers buffer))
                                (unless neo-git--closed
                                  (if (and (integerp status) (zerop status))
@@ -2193,6 +2253,8 @@ Unstaged files are restored from the index; untracked files are deleted."
                   neo-git--commit-kind kind
                   neo-git--commit-head head
                   neo-git--commit-root (buffer-local-value 'neo-git-root status-buffer))
+      (add-hook 'kill-buffer-hook #'neo-git--stop-processes t t)
+      (add-hook 'kill-buffer-query-functions #'neo-git--can-kill nil t)
       (use-local-map (copy-keymap text-mode-map))
       (local-set-key (kbd "C-c C-c") #'neo-git-commit-finish)
       (local-set-key (kbd "C-c C-k") #'neo-git-commit-cancel))
@@ -2264,6 +2326,7 @@ Unstaged files are restored from the index; untracked files are deleted."
                           (neo-git--render))))))
                 )))
           (when (and neo-git--mutation (process-live-p process))
+            (process-put process 'neo-git-source commit-buffer)
             (neo-git--progress-set-process process)))))))
 
 (defun neo-git-commit-cancel ()
@@ -2580,7 +2643,7 @@ In stash lists, SPC: apply without deleting; d: delete with confirmation."
     (if (and (buffer-live-p owner)
              (eq (selected-window) (buffer-local-value 'neo-git--history-window owner)))
         (neo-git-focus-list)
-      (quit-window))))
+      (neo-git--quit-window))))
 
 (defun neo-git--refresh-browsers (owner &optional kind)
   "Refresh OWNER's browser buffers, only those of KIND when non-nil."
@@ -2835,31 +2898,36 @@ One row per commit: ● commit, ○ merge, <─┐ merged branch, ─┘ fork po
 (defun neo-git-browser-show ()
   "Show the selected commit or stash without enabling index changes."
   (interactive)
-  (let* ((oid (or (tabulated-list-get-id) (user-error "Select an entry")))
-         (buffer (get-buffer-create (format "*Neo Git Show: %s*" oid)))
+  (let* ((owner neo-git--diff-owner)
+         (oid (or (tabulated-list-get-id) (user-error "Select an entry")))
+         (buffer (get-buffer-create (format "*Neo Git Show: %s: %s*"
+                                            (directory-file-name neo-git-root) oid)))
          (args (if (eq neo-git--browser-kind 'stash)
                    (list "stash" "show" "-p" "--include-untracked")
                  '("show" "--format=fuller"))))
     (with-current-buffer buffer
       (let ((inhibit-read-only t)) (erase-buffer) (insert "Loading…\n"))
       (diff-mode)
+      (setq-local neo-git--diff-owner owner)
       (setq buffer-read-only t)
       (let ((map (make-sparse-keymap)))
         (set-keymap-parent map diff-mode-map)
-        (define-key map (kbd "q") #'quit-window)
-        (define-key map (kbd "<escape>") #'quit-window)
+        (define-key map (kbd "q") #'neo-git--quit-window)
+        (define-key map (kbd "<escape>") #'neo-git--quit-window)
         (use-local-map map)
         (when (fboundp 'evil-define-key*)
           (evil-define-key* '(normal motion) map
-            (kbd "q") #'quit-window (kbd "<escape>") #'quit-window))))
-    (neo-git--run
-     neo-git-root (append args '("--no-ext-diff" "--no-textconv" "--no-color") (list oid))
-     (lambda (status output errors)
-       (when (buffer-live-p buffer)
-         (with-current-buffer buffer
-           (let ((inhibit-read-only t))
-             (erase-buffer) (insert (if (eq status 0) output errors))
-             (goto-char (point-min)))))))
+            (kbd "q") #'neo-git--quit-window (kbd "<escape>") #'neo-git--quit-window))))
+    (let ((root neo-git-root))
+      (with-current-buffer buffer
+        (neo-git--run
+         root (append args '("--no-ext-diff" "--no-textconv" "--no-color") (list oid))
+         (lambda (status output errors)
+           (when (buffer-live-p buffer)
+             (with-current-buffer buffer
+               (let ((inhibit-read-only t))
+                 (erase-buffer) (insert (if (eq status 0) output errors))
+                 (goto-char (point-min)))))))))
     (let ((window (and (buffer-live-p neo-git--diff-owner)
                        (buffer-local-value 'neo-git--preview-window neo-git--diff-owner))))
       (if (window-live-p window)

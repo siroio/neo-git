@@ -2,6 +2,10 @@
 
 Emacs 用の小さな非同期 Git インターフェースです。フレーム全体を使い、左上に変更一覧、左下にマージの推移線付きコミット履歴、右に選択ファイルの差分を表示します。ファイル・行・hunk 単位のステージ操作ができます。閉じると元のウィンドウ配置に戻ります。
 
+Git画面を終了すると、その画面の差分・履歴・ログ・コミット編集バッファを破棄し、状態・差分などの取得処理とタイマーを停止します。commit・merge・rebase・fetch・pushなどの変更処理が実行中の場合は、処理が成功または失敗で終了するまでバッファの破棄を保留します。一覧バッファを直接削除した場合も同じ扱いです。作業ファイルのバッファや、別リポジトリのGit画面は保持します。
+
+コミット編集の `C-c C-k` は、Gitコマンドの開始前なら編集を中止し、開始後ならcommitの完了を待って編集バッファを破棄します。対話的rebaseなどがエディタ入力を待っている場合は、その入力を完了するまで終了を保留します。
+
 Emacs 29.1 以上と PATH 上の Git が必要です。依存する Lisp ライブラリは Emacs 標準のものだけです。Evil は任意で、通常の Emacs でも使えます。
 
 ## インストール
@@ -91,6 +95,7 @@ emacs -Q --batch -l check-git-advanced.el
 emacs -Q --batch -l check-refresh.el
 emacs -Q --batch -l check-navigation.el
 emacs -Q --batch -l check-remote-delete.el
+emacs -Q --batch -l check-cleanup.el
 ```
 
 `check-package.el` は一時的な package ディレクトリへインストールし、autoload と標準ライブラリだけでの起動を確認します。`check-git.el` は一時 Git リポジトリでステージ・部分操作・commit・fetch・pull・push などを検証します。`check-git-workflows.el` は履歴グラフ・ブランチ・stash・merge・rebase・cherry-pick を検証します。`benchmark-git.el` は既存の検証が使用するプロセス計測コードです。
@@ -102,6 +107,8 @@ emacs -Q --batch -l check-remote-delete.el
 `check-navigation.el` は一覧の上下端・見出しを越える移動と差分の追従を検証します。Evilを先にロードして実行すると、`Ctrl+D` / `Ctrl+U`の連続入力も検証します。
 
 `check-remote-delete.el` は一時bare remoteで削除確認・取消、他者による更新時の拒否、削除後の一覧更新、同名ローカルブランチの保持を検証します。
+
+`check-cleanup.el` は終了・バッファ削除時の関連バッファ、非同期プロセス、タイマーの解放と、別画面の保持を検証します。変更処理の成功・失敗、複数段階の処理、実際のpre-commit hookで待機中のcommitについて、完了まで停止・破棄を保留することも確認します。
 
 ### GUIでのMagit比較
 

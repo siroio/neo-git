@@ -562,7 +562,7 @@
     (when (get-buffer status-buffer)
       (with-current-buffer status-buffer
         (neo-git-quit))
-      (kill-buffer status-buffer))
+      (cl-assert (not (get-buffer status-buffer))))
     (when (get-buffer "*Neo Git Check Diff*")
       (kill-buffer "*Neo Git Check Diff*"))
     (delete-directory root t)))
@@ -611,7 +611,7 @@
     (when (get-buffer status-buffer)
       (with-current-buffer status-buffer
         (neo-git-quit))
-      (kill-buffer status-buffer))
+      (cl-assert (not (get-buffer status-buffer))))
     (delete-directory root t)))
 
 (defun neo-git-check-partial-patch (root path kind needle operation &optional mode)
