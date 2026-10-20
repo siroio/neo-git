@@ -2392,6 +2392,7 @@ Unstaged files are restored from the index; untracked files are deleted."
              return operation)))
 
 (defun neo-git-pull ()
+  "Pull the upstream, temporarily stashing tracked local changes."
   (interactive)
   (when (seq-some (lambda (e)
                     (eq (plist-get e :kind) 'conflict)) neo-git-entries)
@@ -2399,8 +2400,8 @@ Unstaged files are restored from the index; untracked files are deleted."
   (when (neo-git--in-progress-p)
     (user-error "Finish the current merge/rebase before pulling"))
   (let ((target (neo-git--upstream-target)))
-    (neo-git--mutate (append '("pull" "--progress") target)
-                     (format "pull %s/%s" (car target) (cadr target)))))
+    (neo-git--mutate (append '("pull" "--progress" "--autostash") target)
+                     (format "pull %s/%s" (car target) (cadr target)) nil t)))
 
 (defun neo-git-push ()
   (interactive)

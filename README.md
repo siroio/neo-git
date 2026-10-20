@@ -61,6 +61,10 @@ Git リポジトリ内のファイルやディレクトリから `M-x neo-git-st
 | `?` | キー案内 |
 | `q` | 一覧では Git 画面を終了、差分では一覧へ戻る |
 
+`p` のpullは、追跡済みファイルの未コミット変更をGitの `--autostash` で一時退避し、取り込み後に復元します。merge／rebaseの選択は対象リポジトリのGit設定に従います。未保存のバッファは先に保存してください。処理後は開いている作業ファイルと変更一覧を更新します。
+
+自動退避からの復元では、ステージ済みの変更が未ステージに戻る場合があります。未追跡ファイルは退避せず、取り込むファイルと同名なら上書きを拒否します。復元で競合した場合は変更一覧から `E` で解決してください。退避内容はstash一覧に残るため、復元結果を確認してから削除できます。取り込み自体が完了している場合は `A` でのcontinueは不要です。merge／rebase自体が競合している場合は、解決後に `A` でcontinue、またはabortしてください。
+
 部分ステージは追跡済みの通常テキスト差分に対応し、Git の index だけを変更します。未追跡ファイルは一覧からファイル単位でステージしてください。rename、競合、binary、mode 変更、新規・削除ファイルの部分操作は拒否します。
 
 通常のunstaged差分は強調表示済みのバッファを直近8件キャッシュし、同じファイルへ戻るときのGit再起動と表示処理の再計算を省きます。ファイル・index・属性ファイルの内容を確認し、変更があれば取り直します。`r` / `R` の更新でキャッシュを消去します。Git設定を変更した場合も更新してください。ファイルやindexが1 MiBを超える場合、staged・rename・競合・特殊ファイルは従来どおりGitから取得します。部分ステージ前には、キャッシュの有無にかかわらずGitで差分を再確認します。
@@ -90,6 +94,7 @@ reflog一覧の `B` は選択コミットから復旧ブランチを作成し、
 ```sh
 emacs -Q --batch -l check-package.el
 emacs -Q --batch -l check-git.el
+emacs -Q --batch -l check-pull.el
 emacs -Q --batch -l check-git-workflows.el
 emacs -Q --batch -l check-git-advanced.el
 emacs -Q --batch -l check-refresh.el
@@ -101,6 +106,8 @@ emacs -Q --batch -l check-cleanup.el
 `check-package.el` は一時的な package ディレクトリへインストールし、autoload と標準ライブラリだけでの起動を確認します。`check-git.el` は一時 Git リポジトリでステージ・部分操作・commit・fetch・pull・push などを検証します。`check-git-workflows.el` は履歴グラフ・ブランチ・stash・merge・rebase・cherry-pick を検証します。`benchmark-git.el` は既存の検証が使用するプロセス計測コードです。
 
 `check-git-advanced.el` はamend、indexを保持するreword、fixup、競合解決、実際のemacsclient経由のrebase編集・中止、復旧ブランチ、reflog、resetを一時リポジトリで検証します。
+
+`check-pull.el` はローカルremoteを使い、merge／rebase設定での未コミット変更の保持、バッファ再読込、自動退避の復元競合、未保存編集と未追跡ファイルの保護を検証します。
 
 `check-refresh.el` はリポジトリ本体・`.git`削除後の更新で古い一覧・差分・履歴が消え、再作成後に更新できることを検証します。状態取得に失敗した画面にはエラーを表示し、`r`で再試行できます。
 
