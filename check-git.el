@@ -620,12 +620,14 @@
          (diff (apply #'neo-git-check-output arguments))
          bounds)
     (with-temp-buffer
-      (insert diff)
+      (neo-git--show-diff-result nil (current-buffer) 0 diff "" (list path kind) 0)
+      (cl-assert (equal neo-git--diff-source
+                        (buffer-substring-no-properties (point-min) (point-max))))
       (goto-char (point-min))
       (unless (search-forward needle nil t)
         (error "Changed line %S missing from diff: %s" needle diff))
-      (let ((line (line-number-at-pos)))
-        (setq bounds (cons line line))))
+      (cl-assert (get-text-property (point) 'line-prefix))
+      (setq bounds (neo-git--partial-selected-lines)))
     (neo-git--partial-build-patch (neo-git--partial-hunks diff) bounds (or mode 'line) operation)))
 
 (let* ((root (make-temp-file "neo-git-partial-edge-" t))

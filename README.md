@@ -2,6 +2,10 @@
 
 Emacs 用の小さな非同期 Git インターフェースです。フレーム全体を使い、左上に変更一覧、左下にマージの推移線付きコミット履歴、右に選択ファイルの差分を表示します。ファイル・行・hunk 単位のステージ操作ができます。閉じると元のウィンドウ配置に戻ります。
 
+差分は追加・削除行を薄い背景、行内の変更箇所を濃い背景で表示します。ファイル見出しを区切り線と太字、hunk見出しを太字で区別し、左端の `old` / `new` 列に変更前・変更後の行番号を表示します。行番号は表示だけに付けるため、コピーするdiff本文、行選択、部分stage・解除、元ファイルへのジャンプは従来どおりです。コミット・stashの差分にも適用します。
+
+行内の詳細な強調と構文色は標準の `diff-mode` の設定を引き継ぎます（行内強調は `diff-refine` と外部 `diff` コマンドを使用）。Emacs 31以降では自動の行内強調を非同期で順次反映し、変更箇所が多いdiffでも外部コマンドの完了を待たずに本文を表示・操作できます。表示更新・終了時には処理と一時ファイルを回収します。旧版Emacsと手動の `diff-refine-hunk` は標準の同期処理を使います。配色は `neo-git-diff-*` faceで調整できます。バイナリ差分やcombined diffなど通常のunified diff以外には、旧・新行番号を追加しません。
+
 Git画面を終了すると、その画面の差分・履歴・ログ・コミット編集バッファを破棄し、状態・差分などの取得処理とタイマーを停止します。commit・merge・rebase・fetch・pushなどの変更処理が実行中の場合は、処理が成功または失敗で終了するまでバッファの破棄を保留します。一覧バッファを直接削除した場合も同じ扱いです。作業ファイルのバッファや、別リポジトリのGit画面は保持します。
 
 コミット編集の `C-c C-k` は、Gitコマンドの開始前なら編集を中止し、開始後ならcommitの完了を待って編集バッファを破棄します。対話的rebaseなどがエディタ入力を待っている場合は、その入力を完了するまで終了を保留します。
@@ -101,6 +105,8 @@ emacs -Q --batch -l check-refresh.el
 emacs -Q --batch -l check-navigation.el
 emacs -Q --batch -l check-remote-delete.el
 emacs -Q --batch -l check-cleanup.el
+emacs -Q --batch -L . -l check-diff-display.el -f ert-run-tests-batch-and-exit
+emacs -Q --batch -L . -l check-diff-performance.el -f ert-run-tests-batch-and-exit
 ```
 
 `check-package.el` は一時的な package ディレクトリへインストールし、autoload と標準ライブラリだけでの起動を確認します。`check-git.el` は一時 Git リポジトリでステージ・部分操作・commit・fetch・pull・push などを検証します。`check-git-workflows.el` は履歴グラフ・ブランチ・stash・merge・rebase・cherry-pick を検証します。`benchmark-git.el` は既存の検証が使用するプロセス計測コードです。

@@ -17,6 +17,8 @@
 (require 'subr-x)
 (require 'seq)
 (require 'diff-mode)
+(eval-when-compile (require 'smerge-mode))
+(require 'face-remap)
 (require 'hl-line)
 (require 'tabulated-list)
 
@@ -27,6 +29,9 @@
 (defvar server-use-tcp)
 (defvar server-auth-dir)
 (defvar server-socket-dir)
+(declare-function smerge--refine-prepare-regions "smerge-mode" (ol1 ol2 preproc))
+(declare-function smerge--refine-set-overlay-props "smerge-mode" (ol1 ol2 props-c props-r props-a))
+(declare-function smerge--refine-apply-diff "smerge-mode" (diffbuf ol1 ol2 props-c props-r props-a))
 (declare-function server-running-p "server" (&optional name))
 (declare-function server-edit "server" (&optional arg))
 (declare-function server-edit-abort "server" ())
@@ -1404,6 +1409,182 @@ C-c C-n/p move; C-c C-m/o/b keep upper/lower/both; C-c C-e opens Ediff."
         (when (process-live-p process)
           (delete-process process))))))
 
+(defface neo-git-diff-added
+  '((((class color) (background dark)) (:background "#19352b" :extend t))
+    (((class color) (background light)) (:background "#e2f3e5" :extend t))
+    (t (:inherit diff-added)))
+  "Quiet background for added lines." :group 'neo-git)
+(defface neo-git-diff-removed
+  '((((class color) (background dark)) (:background "#3c242b" :extend t))
+    (((class color) (background light)) (:background "#fbe4e7" :extend t))
+    (t (:inherit diff-removed)))
+  "Quiet background for removed lines." :group 'neo-git)
+(defface neo-git-diff-refine-added
+  '((((class color) (background dark)) (:background "#286749" :weight bold))
+    (((class color) (background light)) (:background "#aadbb5" :weight bold))
+    (t (:inherit diff-refine-added :weight bold)))
+  "Emphasize changed text within added lines." :group 'neo-git)
+(defface neo-git-diff-refine-removed
+  '((((class color) (background dark)) (:background "#803e4b" :weight bold))
+    (((class color) (background light)) (:background "#f0acb7" :weight bold))
+    (t (:inherit diff-refine-removed :weight bold)))
+  "Emphasize changed text within removed lines." :group 'neo-git)
+(defface neo-git-diff-file-header
+  '((t (:inherit font-lock-function-name-face :weight bold :overline t :extend t)))
+  "Separate file headers from diff contents." :group 'neo-git)
+(defface neo-git-diff-hunk-header
+  '((t (:inherit font-lock-keyword-face :weight bold :extend t)))
+  "Highlight hunk locations and their function context." :group 'neo-git)
+(defvar-local neo-git--diff-faces-installed nil)
+(defvar-local neo-git--refine-process nil)
+(defvar-local neo-git--refine-queue nil)
+
+(defun neo-git--stop-refinement (&rest _)
+  "Cancel pending highlighting when the preview changes or closes."
+  (setq neo-git--refine-queue nil)
+  (let ((process neo-git--refine-process))
+    (setq neo-git--refine-process nil)
+    (when (process-live-p process) (delete-process process))))
+
+(defun neo-git--refine-next ()
+  "Run one queued refinement using diff-mode's preparation and overlay logic."
+  (unless neo-git--refine-process
+    (while (and neo-git--refine-queue
+                (/= (caar neo-git--refine-queue) (buffer-chars-modified-tick)))
+      (pop neo-git--refine-queue))
+    (when neo-git--refine-queue
+      (pcase-let* ((`(,tick ,beg1 ,end1 ,beg2 ,end2 ,props-c ,preproc ,props-r ,props-a)
+                    (pop neo-git--refine-queue))
+                   (source (current-buffer))
+                   (output (generate-new-buffer " *neo-git-refine*"))
+                   (ol1 (make-overlay beg1 end1 nil t nil))
+                   (ol2 (make-overlay beg2 end2 nil t nil))
+                   (files nil)
+                   (applied nil))
+        (cl-labels
+            ((dispose ()
+               (dolist (file files) (ignore-errors (delete-file file)))
+               (when (buffer-live-p output) (kill-buffer output))
+               (unless applied (delete-overlay ol1) (delete-overlay ol2)))
+             (failed (failure)
+               (setq neo-git--refine-queue nil)
+               (message "Neo Git: refinement failed: %s" (error-message-string failure)))
+             (finished (process _event)
+               (when (memq (process-status process) '(exit signal))
+                 (unwind-protect
+                     (when (buffer-live-p source)
+                       (with-current-buffer source
+                         (when (eq process neo-git--refine-process)
+                           (setq neo-git--refine-process nil)
+                           (when (= tick (buffer-chars-modified-tick))
+                             (condition-case failure
+                                 (if (and (eq (process-status process) 'exit)
+                                          (memq (process-exit-status process) '(0 1)))
+                                     (progn
+                                       (smerge--refine-apply-diff output ol1 ol2
+                                                                  props-c props-r props-a)
+                                       (setq applied t))
+                                   (error "diff exited with status %s"
+                                          (process-exit-status process)))
+                               (error (failed failure)))))))
+                   (dispose))
+                 (when (buffer-live-p source)
+                   (with-current-buffer source (neo-git--refine-next))))))
+          (condition-case failure
+              (progn
+                (setq files (smerge--refine-prepare-regions ol1 ol2 preproc))
+                (smerge--refine-set-overlay-props ol1 ol2 props-c props-r props-a)
+                (setq neo-git--refine-process
+                      (make-process
+                       :name "neo-git-refine" :buffer output :noquery t
+                       :connection-type 'pipe
+                       :coding (if (eq system-type 'windows-nt)
+                                   (cons 'utf-8-emacs locale-coding-system)
+                                 'utf-8-emacs)
+                       :command (append (list diff-command
+                                              (if (and smerge-refine-ignore-whitespace
+                                                       (not smerge-refine-weight-hack))
+                                                  "-awd" "-ad"))
+                                        files)
+                       :sentinel #'finished)))
+            (error (dispose) (failed failure))))))))
+
+(defun neo-git--font-lock-refined (limit)
+  "Queue automatic refinement without waiting for external diff during redisplay."
+  (when (eq diff-refine 'font-lock)
+    (require 'smerge-mode)
+    (if (not (fboundp 'smerge--refine-prepare-regions))
+        ;; Older Emacs releases do not expose the preparation/overlay helpers.
+        (diff--font-lock-refined limit)
+      (let (jobs)
+        ;; Keep diff-mode's hunk limits and refinement markers, replacing only the I/O.
+        (cl-letf (((symbol-function 'smerge-refine-regions)
+                   (lambda (&rest args)
+                     (push (cons (buffer-chars-modified-tick) args) jobs))))
+          (diff--font-lock-refined limit))
+        (setq neo-git--refine-queue (nconc neo-git--refine-queue (nreverse jobs)))
+        (neo-git--refine-next))))
+  nil)
+
+(defun neo-git--decorate-diff ()
+  "Decorate unified diff text without changing characters or buffer positions."
+  (unless neo-git--diff-faces-installed
+    (dolist (face '(diff-added diff-removed diff-refine-added diff-refine-removed
+                   diff-file-header diff-hunk-header))
+      (face-remap-add-relative face (intern (concat "neo-git-" (symbol-name face)))))
+    (font-lock-remove-keywords nil '((diff--font-lock-refined)))
+    (font-lock-add-keywords nil '((neo-git--font-lock-refined)) 'append)
+    (dolist (hook '(before-change-functions kill-buffer-hook change-major-mode-hook
+                   font-lock-mode-hook))
+      (add-hook hook #'neo-git--stop-refinement nil t))
+    (setq neo-git--diff-faces-installed t))
+  (save-excursion
+    (save-match-data
+      (with-silent-modifications
+        (remove-text-properties (point-min) (point-max) '(line-prefix nil wrap-prefix nil))
+        (let ((header "^@@ -\\([0-9]+\\)\\(?:,\\([0-9]+\\)\\)? [+]\\([0-9]+\\)\\(?:,\\([0-9]+\\)\\)? @@")
+              (width 3) (old 0) (new 0) (old-left 0) (new-left 0)
+              number-format)
+          (goto-char (point-min))
+          (while (re-search-forward header nil t)
+            (setq width (max width
+                             (length (number-to-string
+                                      (+ (string-to-number (match-string 1))
+                                         (string-to-number (or (match-string 2) "1")))))
+                             (length (number-to-string
+                                      (+ (string-to-number (match-string 3))
+                                         (string-to-number (or (match-string 4) "1"))))))))
+          (goto-char (point-min))
+          (setq number-format (format "%%%ds %%%ds │ " width width))
+          (while (not (eobp))
+            (let* ((beg (point)) (end (line-end-position))
+                   (next (min (point-max) (1+ end))) prefix)
+              (cond
+               ((looking-at header)
+                (setq old (string-to-number (match-string 1))
+                      old-left (string-to-number (or (match-string 2) "1"))
+                      new (string-to-number (match-string 3))
+                      new-left (string-to-number (or (match-string 4) "1"))
+                      prefix (format number-format "old" "new")))
+               ((or (and (eq (char-after) ?-) (> old-left 0))
+                    (and (eq (char-after) ?+) (> new-left 0))
+                    (and (eq (char-after) ?\s) (> old-left 0) (> new-left 0)))
+                (let ((removed (eq (char-after) ?-)) (added (eq (char-after) ?+)))
+                  (setq prefix (format number-format
+                                       (if added "" (number-to-string old))
+                                       (if removed "" (number-to-string new))))
+                  (unless added (cl-incf old) (cl-decf old-left))
+                  (unless removed (cl-incf new) (cl-decf new-left))))
+               ((looking-at "\\\\ No newline at end of file") nil)
+               (t (setq old-left 0 new-left 0)))
+              (when prefix
+                (put-text-property beg next 'line-prefix (propertize prefix 'face 'shadow))
+                (put-text-property beg next 'wrap-prefix
+                                   (propertize (concat (make-string (1+ (* 2 width)) ?\s) " │ ")
+                                               'face 'shadow)))
+              (forward-line 1))))))))
+
+
 (defun neo-git--show-diff-result (owner preview status output error-output
                                         &optional id generation)
   (when (buffer-live-p preview)
@@ -1414,6 +1595,7 @@ C-c C-n/p move; C-c C-m/o/b keep upper/lower/both; C-c C-e opens Ediff."
                       ((and (integerp status) (zerop status)) output)
                       (t (format "[Diff failed: %s]\n" error-output))))
         (unless (derived-mode-p 'diff-mode) (diff-mode))
+        (neo-git--decorate-diff)
         (setq-local neo-git--diff-updating nil)
         (setq-local neo-git--diff-owner owner)
         (setq-local neo-git--diff-source
@@ -2928,6 +3110,7 @@ One row per commit: ● commit, ○ merge, <─┐ merged branch, ─┘ fork po
              (with-current-buffer buffer
                (let ((inhibit-read-only t))
                  (erase-buffer) (insert (if (eq status 0) output errors))
+                 (neo-git--decorate-diff)
                  (goto-char (point-min)))))))))
     (let ((window (and (buffer-live-p neo-git--diff-owner)
                        (buffer-local-value 'neo-git--preview-window neo-git--diff-owner))))

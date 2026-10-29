@@ -85,20 +85,25 @@
           (neo-git--render))
         (evil-local-mode 1)
         (evil-normal-state)
-        (let ((evil-want-C-u-scroll t))
-          (dolist (key '("C-d" "C-u"))
-            (dotimes (_ 20)
-              ;; Batch Emacs does not redisplay the window between macros.
-              (set-window-start (selected-window) (point-min))
-              (condition-case nil
-                  (execute-kbd-macro (kbd key))
-                ((beginning-of-buffer end-of-buffer) nil))
-              (should (if browser (tabulated-list-get-id)
-                        (neo-git--entry-at-point))))
-            (should (if browser (= (tabulated-list-get-id) (if (equal key "C-d") 2 0))
-                      (equal (plist-get (neo-git--entry-at-point) :path)
-                             (if (equal key "C-d") "file-2" "file-0")))))
-          (should (if browser (= (tabulated-list-get-id) 0)
-                    (equal (plist-get (neo-git--entry-at-point) :path) "file-0"))))))))
+        ;; Binding the option with `let' does not update Evil's keymap.
+        (evil-local-set-key 'normal (kbd "C-u") #'evil-scroll-up)
+        (should (eq (key-binding (kbd "C-u")) #'evil-scroll-up))
+        (should (eq (key-binding (kbd "C-d")) #'evil-scroll-down))
+        (dolist (key '("C-d" "C-u"))
+          (dotimes (_ 20)
+            ;; Batch Emacs does not redisplay the window between macros.
+            (set-window-start (selected-window) (point-min))
+            (condition-case nil
+                (execute-kbd-macro (kbd key))
+              ((beginning-of-buffer end-of-buffer) nil))
+            (should (if browser (tabulated-list-get-id)
+                      (neo-git--entry-at-point)))
+            (unless browser
+              (should (equal (neo-git--selected-id) neo-git--current-selection))))
+          (should (if browser (= (tabulated-list-get-id) (if (equal key "C-d") 2 0))
+                    (equal (plist-get (neo-git--entry-at-point) :path)
+                           (if (equal key "C-d") "file-2" "file-0")))))
+        (should (if browser (= (tabulated-list-get-id) 0)
+                  (equal (plist-get (neo-git--entry-at-point) :path) "file-0")))))))
 
 (ert-run-tests-batch-and-exit)
