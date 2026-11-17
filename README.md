@@ -1,6 +1,6 @@
 # neo-git
 
-Emacs 用の小さな非同期 Git インターフェースです。フレーム全体を使い、左上に変更一覧、左下にマージの推移線付きコミット履歴、右に選択ファイルの差分を表示します。ファイル・行・hunk 単位のステージ操作ができます。閉じると元のウィンドウ配置に戻ります。
+Emacs 用の非同期 VCS インターフェースです。Git・Jujutsu (`jj`)・Mercurial (`hg`)・Subversion (`svn`)・Perforce (`p4`) に対応します。フレーム全体を使い、左上に変更一覧、左下に履歴、右に差分を表示します。閉じると元のウィンドウ配置に戻ります。Gitでは従来の履歴グラフとファイル・行・hunk 単位のステージ操作を利用できます。
 
 差分は追加・削除行を薄い背景、行内の変更箇所を濃い背景で表示します。ファイル見出しを区切り線と太字、hunk見出しを太字で区別し、左端の `old` / `new` 列に変更前・変更後の行番号を表示します。行番号は表示だけに付けるため、コピーするdiff本文、行選択、部分stage・解除、元ファイルへのジャンプは従来どおりです。コミット・stashの差分にも適用します。
 
@@ -10,7 +10,7 @@ Git画面を終了すると、その画面の差分・履歴・ログ・コミ�
 
 コミット編集の `C-c C-k` は、Gitコマンドの開始前なら編集を中止し、開始後ならcommitの完了を待って編集バッファを破棄します。対話的rebaseなどがエディタ入力を待っている場合は、その入力を完了するまで終了を保留します。
 
-Emacs 29.1 以上と PATH 上の Git が必要です。依存する Lisp ライブラリは Emacs 標準のものだけです。Evil は任意で、通常の Emacs でも使えます。
+Emacs 29.1 以上と、利用するVCSのCLIが PATH 上に必要です。依存する Lisp ライブラリは Emacs 標準のものだけです。Evil は任意で、通常の Emacs でも使えます。
 
 ## インストール
 
@@ -29,9 +29,52 @@ Emacs 30 以上では `use-package` でも設定できます。
   :bind ("C-x g" . neo-git-status))
 ```
 
-ダウンロードした `neo-git.el` を `M-x package-install-file` でインストールすることもできます。
+Gitのみ使う場合は、ダウンロードした `neo-git.el` を `M-x package-install-file` でインストールすることもできます。4つの追加VCSには `neo-vcs.el` と `neo-vcs-{jj,hg,svn,p4}.el` も必要です。上記の `package-vc-install` はまとめて導入します。手動配置の場合は6ファイルを同じ `load-path` 上のディレクトリに置いてください。
 
-## 操作
+## VCSの選択と共通操作
+
+作業ディレクトリから `M-x neo-git-status` または `M-x neo-vcs-status` で開きます。最も近い `.jj`・`.hg`・`.svn`・`.git` を検出し、jjとGitが同じ場所にある場合はjjを選びます。`C-u M-x neo-git-status` で明示的に `git`・`jj`・`hg`・`svn`・`p4` を選べます。Gitを選ぶと従来のGit画面を開きます。
+
+Perforceは `P4CONFIG` の設定ファイルまたは `P4CLIENT` があれば自動選択します。それ以外は `p4` を明示的に選択してください。既存の接続・ログイン設定を使い、選択時の接続先・ユーザー・クライアントを画面に固定します。ログインやworkspace作成はP4のCLIで済ませてください。
+
+以下はjj・Mercurial・SVN・Perforce画面の共通キーです。Git画面のキーは次節のとおりです。
+
+| キー | 操作 |
+| --- | --- |
+| `j` / `k` | 一覧または差分内の移動 |
+| `SPC` / `a` | ファイルをマーク／表示中の全件のマークを切替 |
+| `RET` / `TAB` | 差分ペインへ移動。履歴の `RET` はリビジョン差分を表示 |
+| `l` | 履歴ペインへ移動 |
+| `o` | 作業ファイルを開く |
+| `/` | ファイル名で絞り込み |
+| `x` / `?` | VCS固有の操作メニュー／キー案内 |
+| `r` / `R` | 状態・履歴を更新 |
+| `@` | コマンドとエラーログを表示 |
+| `q` | 一覧では終了。差分・履歴では一覧へ戻る |
+| `C-c C-c` / `C-c C-k` | メッセージ編集で実行／編集を中止 |
+
+マークがなければカーソル位置のファイル、マークがあれば表示中のマーク済みファイルを操作します。新しい4つのVCSはファイル単位の操作です。Gitの部分ステージは引き続き利用できます。
+
+| VCS | 固有の操作 |
+| --- | --- |
+| jj | `c` describe、`n` new、`b` edit、`s` 選択ファイルをsplit、`S` 親へsquash、`d` restore、`B` bookmark設定、`f` Git remote fetch、`P` push |
+| Mercurial | `A` add、`d` remove、`D` ファイルを指定してremove、`v` revert、`c` 選択ファイルをcommit、`C` マージ全体をcommit、`u` update、`b` bookmark、`M` merge、`f` pull、`P` push |
+| SVN | `A` add、`d` delete、`D` ファイルを指定してdelete、`v` revert、`c` 選択対象をcommit、`u` update、`s` switch、`z` 作業内容を採用してresolvedにする |
+| Perforce | `e` edit、`A` add、`d` delete、`g` reconcile、`v` revert、`c` 空の番号付きchange作成、`m` changeへreopen、`C` 番号付きchangeをsubmit、`u` sync、`s` shelve、`U` unshelve、`z` 安全な自動resolve |
+
+Git以外にはGitのindexを模した領域を設けず、VCS本来の単位を使います。jjのメッセージ編集は開始時のchangeを対象にします。Mercurialのマージコミットは全変更を含む専用操作で、確認後に実行します。SVNの選択commitは `--depth empty` を使い、選んだディレクトリの子を暗黙に含めません。ルートディレクトリ自身の属性変更は閲覧のみで、更新操作はCLIで行ってください。
+
+Perforceは番号付きchange・default change・未openの変更候補を区別します。変更一覧のreconcileはpreviewだけです。submitは指定した番号付きchange全体を対象にし、選択ファイルを自動で移動しません。作成した番号はヘッダーとメッセージに表示します。shelveは選択ファイルだけ、unshelveは現在のclient範囲で実行します。editとdeleteは変更一覧にない通常ファイルも指定できます。moveの対を分断する操作や、filespecとして曖昧な `...` を含むファイル名は拒否します。
+
+Perforceの非ASCIIファイル名・メッセージにはUnicodeサーバーが必要です。コマンド入出力は `-Q utf8`、日本語などのファイル指定は `-x -` のUTF-8入力を使います。非Unicodeサーバーでの非ASCII入力や、文字コードが壊れた既存パスは実行前・一覧取得時に拒否します。改行を含む非ASCIIファイル名も対象外です。日本語ファイル名は実サーバーで検証済みですが、日本語を含むworkspaceルート・client名・user名は未検証です。[Perforceの文字コード仕様](https://help.perforce.com/helix-core/server-apps/cmdref/current/Content/CmdRef/global.options.html)
+
+破棄・履歴変更・サーバーへの送信などは対象を表示して確認します。作業ツリー内に未保存バッファがあれば、更新操作の前に保存を求めます。実行中の変更処理は画面を閉じても中断せず、終了後にバッファを回収します。失敗したメッセージは編集可能なまま残します。外部エディタを要求する操作、対話的な競合解決、depot管理は各CLIで行ってください。Perforceの安全な自動resolveで残った競合は、手動解決後に更新してください。
+
+CLIが終了コード0でも警告を返した場合は、その内容を結果として表示します。Mercurialのpushは失敗と「送信対象なし」がともに終了コード1になるため、どちらもCLIの出力付きで非成功として表示します。詳細は `@` のログで確認できます。
+
+実CLIで検証した版はEmacs 31.1、jj 0.46.0、Mercurial 7.2.4、SVN 1.14.2、P4/P4D 2026.1です。jjの構造化diff templateなどを使うため、古いCLIとの互換性は保証していません。現時点ではローカルworkspaceが対象です。新4VCSの履歴は最新100件を表示します。
+
+## Gitの操作
 
 Git リポジトリ内のファイルやディレクトリから `M-x neo-git-status` を実行します。
 
@@ -107,7 +150,18 @@ emacs -Q --batch -l check-remote-delete.el
 emacs -Q --batch -l check-cleanup.el
 emacs -Q --batch -L . -l check-diff-display.el -f ert-run-tests-batch-and-exit
 emacs -Q --batch -L . -l check-diff-performance.el -f ert-run-tests-batch-and-exit
+emacs -Q --batch -l check-vcs-package.el
+emacs -Q --batch -L . -l check-vcs.el -l check-vcs-integration.el -l check-vcs-jj.el -l check-vcs-hg.el -l check-vcs-svn.el -l check-vcs-p4.el -f ert-run-tests-batch-and-exit
 ```
+
+追加VCSのテストは一時リポジトリを作り、インストール済みCLIがあれば実際の操作も検証します。CLIがない場合の実操作テストと、Evilがない場合のEvilテストはskipされます。Perforceの実操作テストには隔離サーバーが必要です。Windowsでは公式の `p4.exe` と `p4d.exe` を `var/multi-vcs/tools/` に置き、次を実行します。専用サーバーとworkspaceを `var/multi-vcs/` 以下に作り、そのサーバーだけを終了します。共有サーバーやユーザー設定は変更しません。
+
+```powershell
+./tools/check-vcs-p4.ps1 -Emacs 'C:/path/to/emacs.exe'
+./tools/check-vcs-p4.ps1 -Unicode -Emacs 'C:/path/to/emacs.exe'
+```
+
+`-Unicode` は新規のテスト用サーバーだけをUnicodeモードで初期化し、日本語パスを含む同じワークフローを検証します。
 
 `check-package.el` は一時的な package ディレクトリへインストールし、autoload と標準ライブラリだけでの起動を確認します。`check-git.el` は一時 Git リポジトリでステージ・部分操作・commit・fetch・pull・push などを検証します。`check-git-workflows.el` は履歴グラフ・ブランチ・stash・merge・rebase・cherry-pick を検証します。`benchmark-git.el` は既存の検証が使用するプロセス計測コードです。
 

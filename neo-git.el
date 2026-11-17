@@ -3,13 +3,14 @@
 ;; Author: siroio <74674262+siroio@users.noreply.github.com>
 ;; Maintainer: siroio <74674262+siroio@users.noreply.github.com>
 ;; URL: https://github.com/siroio/neo-git
-;; Version: 0.3
+;; Version: 0.4
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: tools, vc
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
 ;;; Commentary:
 ;; A compact file-level Git interface with asynchronous status and diff panes.
+;; Install the accompanying neo-vcs*.el files for native jj, hg, svn and p4.
 
 ;;; Code:
 
@@ -35,6 +36,8 @@
 (declare-function server-running-p "server" (&optional name))
 (declare-function server-edit "server" (&optional arg))
 (declare-function server-edit-abort "server" ())
+(declare-function neo-vcs-detect "neo-vcs" (directory))
+(declare-function neo-vcs-status "neo-vcs" (&optional choose-backend))
 (declare-function smerge-next "smerge-mode" (&optional arg))
 (declare-function smerge-prev "smerge-mode" (&optional arg))
 (declare-function smerge-keep-upper "smerge-mode" ())
@@ -170,12 +173,29 @@
 (defun neo-git--run (directory arguments callback &optional limit stdin)
   "Run Git in DIRECTORY with ARGUMENTS, then call CALLBACK with status/stdout/stderr.
 LIMIT bounds captured stdout; exceeding it reports `output-limit'."
+  (let ((process-environment (copy-sequence process-environment)))
+    (setenv "GIT_EDITOR" (or neo-git--interactive-editor "true"))
+    ;; A deleted .git must not redirect queries into a parent repository.
+    (when (and neo-git-root (equal (expand-file-name directory) neo-git-root))
+      (setenv "GIT_CEILING_DIRECTORIES"
+              (directory-file-name
+               (file-name-directory (directory-file-name neo-git-root)))))
+    (neo-git--run-command
+     directory (cons (neo-git--executable)
+                     (append (list "-C" (expand-file-name directory)) arguments))
+     callback limit stdin arguments)))
+
+(defun neo-git--run-command (directory command callback &optional limit stdin log-arguments)
+  "Run an argument-vector COMMAND asynchronously in DIRECTORY.
+CALLBACK receives status, stdout and stderr.  LIMIT and STDIN bound output
+and provide optional UTF-8 input.  LOG-ARGUMENTS preserves the Git log format."
   (let ((source (current-buffer))
         (owner (or (neo-git--owner-buffer) (current-buffer)))
+        (default-directory (file-name-as-directory (expand-file-name directory)))
         (out (generate-new-buffer " *neo-git-out*"))
         (err (generate-new-buffer " *neo-git-err*"))
         (max-output (or limit (* 16 neo-git--limit)))
-        (log-entry (neo-git--log-start directory arguments))
+        (log-entry (neo-git--log-start directory (or log-arguments command)))
         (finished nil)
         process)
     (cl-labels
@@ -215,26 +235,19 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
                  (if (> bytes max-output)
                      (progn
                        (process-put proc 'neo-git-too-large t)
-                       (delete-process proc))
+                       ;; Drain a write to completion even when its output is
+                       ;; too large; killing it could interrupt a submit.
+                       (unless (process-get proc 'neo-git-write)
+                         (delete-process proc)))
                    (process-put proc 'neo-git-bytes bytes)
                    (with-current-buffer buffer
                      (goto-char (point-max))
                      (insert chunk))))))))
       (condition-case failure
-          (let ((process-environment
-                 (cons (concat "GIT_EDITOR=" (or neo-git--interactive-editor "true"))
-                       process-environment)))
-            ;; A deleted .git must not redirect queries into a parent repository.
-            (when (and neo-git-root (equal (expand-file-name directory) neo-git-root))
-              (setenv "GIT_CEILING_DIRECTORIES"
-                      (directory-file-name
-                       (file-name-directory (directory-file-name neo-git-root)))))
-            ;; Ordinary operations keep Git's prepared message. Interactive
-            ;; operations explicitly route editing back into this Emacs.
+          (progn
             (setq process
                   (make-process :name "neo-git" :buffer out :stderr err
-                                :command (cons (neo-git--executable)
-                                               (append (list "-C" (expand-file-name directory)) arguments))
+                                :command command
                                 :connection-type 'pipe :noquery t
                                 :coding (if (eq system-type 'windows-nt)
                                             (cons 'utf-8-unix
@@ -819,9 +832,17 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
             (setq neo-git--refresh-process process)))))))
 
 ;;;###autoload
-(defun neo-git-status ()
-  "Open the Neo Git interface for the current repository."
-  (interactive)
+(defun neo-git-status (&optional choose-backend)
+  "Open Git or an installed Neo VCS backend for the current workspace.
+With prefix CHOOSE-BACKEND, choose the backend explicitly."
+  (interactive "P")
+  (if (and (require 'neo-vcs nil t)
+           (or choose-backend (memq (neo-vcs-detect default-directory) '(jj hg svn p4))))
+      (neo-vcs-status choose-backend)
+    (neo-git--status-git)))
+
+(defun neo-git--status-git ()
+  "Open the original Git workflow, including in colocated workspaces."
   (neo-git--root default-directory
                  (lambda (root error-output)
                    (if (not root)
@@ -838,7 +859,7 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
                        (neo-git--layout buffer)
                        (neo-git-refresh))))))
 
-(defun neo-git--layout (buffer)
+(defun neo-git--layout (buffer &optional history)
   "Show status BUFFER full-frame: list and history on the left, diff on the right."
   (with-current-buffer buffer
     (unless (get-buffer-window buffer)
@@ -850,7 +871,8 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
   (switch-to-buffer buffer nil t)
   (neo-git--ensure-preview)
   (setq neo-git--history-window (split-window nil nil 'below))
-  (set-window-buffer neo-git--history-window (neo-git--browser-buffer 'history buffer)))
+  (set-window-buffer neo-git--history-window
+                     (or history (neo-git--browser-buffer 'history buffer))))
 
 ;;; Diff preview and navigation
 
