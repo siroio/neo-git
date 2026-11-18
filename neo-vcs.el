@@ -17,6 +17,9 @@
 (defvar-local neo-vcs--generation 0)
 (defvar-local neo-vcs--preview-generation 0)
 (defvar-local neo-vcs--preview-job nil)
+(defvar-local neo-vcs--preview-timer nil)
+(defvar neo-vcs--status-directories nil
+  "Directories already checked while parsing a single status response.")
 (defvar-local neo-vcs--history nil)
 (defvar-local neo-vcs--history-buffer nil)
 (defvar-local neo-vcs--marked nil)
@@ -78,6 +81,16 @@
                t t))))
         (buffer-string)))))
 
+(defun neo-vcs--parent-inside-p (parent root)
+  "Check ancestors of a lexically contained PARENT for links outside ROOT."
+  (or (and neo-vcs--status-directories (gethash parent neo-vcs--status-directories))
+      (let ((dir parent))
+        (while (and (not (equal dir root)) (not (file-symlink-p (directory-file-name dir))))
+          (setq dir (file-name-directory (directory-file-name dir))))
+        (when (if (equal dir root) (file-directory-p root) (file-in-directory-p dir root))
+          (when neo-vcs--status-directories (puthash parent t neo-vcs--status-directories))
+          t))))
+
 (defun neo-vcs--path (context path)
   "Validate PATH is a nonempty file path contained in CONTEXT's root."
   (let* ((root (file-name-as-directory (expand-file-name (plist-get context :root))))
@@ -89,11 +102,14 @@
                  (not (member ".." (split-string path "/" t)))
                  (not (member path '("." "./"))))
       (user-error "Invalid workspace path: %S" path))
-    (let ((absolute (expand-file-name path root)))
-      (unless (and (not (equal (directory-file-name root) absolute))
-                   (file-in-directory-p absolute root))
+    (let* ((absolute (expand-file-name path root))
+           (leaf (directory-file-name absolute))
+           (parent (file-name-directory leaf)))
+      (unless (and (string-prefix-p root absolute) (> (length absolute) (length root))
+                   (if (file-symlink-p leaf) (file-in-directory-p leaf root)
+                     (neo-vcs--parent-inside-p parent root)))
         (user-error "Path leaves the workspace: %S" path))
-      (file-relative-name absolute root))))
+      (substring absolute (length root)))))
 
 (defun neo-vcs--paths (context entries)
   "Validate file ENTRIES and return their literal relative paths."
@@ -125,9 +141,23 @@ Perforce discovery needs P4CONFIG/P4CLIENT or an explicit backend choice."
       (user-error "Open a Neo VCS workspace first"))
     owner))
 
+(defun neo-vcs--parse-status (context parse outputs)
+  ;; Share parent checks only within this snapshot.  Preview and write
+  ;; operations revalidate paths against the filesystem at the time of use.
+  (let* ((neo-vcs--status-directories (make-hash-table :test #'equal))
+         (state (funcall parse outputs)))
+    (unless (plist-member state :entries) (error "Malformed status response"))
+    (dolist (entry (plist-get state :entries))
+      (unless (and (plist-get entry :root-entry) (equal (plist-get entry :path) "."))
+        (neo-vcs--path context (plist-get entry :path))))
+    state))
+
 (defun neo-vcs--request (context operation &optional target options)
-  (funcall (plist-get (neo-vcs--backend (plist-get context :backend)) :request)
-           context operation target options))
+  (let ((request (funcall (plist-get (neo-vcs--backend (plist-get context :backend)) :request)
+                          context operation target options)))
+    (if (not (eq operation 'status)) request
+      (plist-put (copy-sequence request) :parse
+                 (apply-partially #'neo-vcs--parse-status context (plist-get request :parse))))))
 
 (defun neo-vcs--finish-job (job status result diagnostic)
   (unless (neo-vcs--job-done job)
@@ -220,6 +250,7 @@ WRITE jobs are never cancelled by refresh or buffer disposal."
       (neo-vcs--finish-job job 'cancelled nil "Cancelled")))
 
 (defun neo-vcs--cancel-reads ()
+  (neo-vcs--cancel-preview-timer)
   (dolist (job (copy-sequence neo-vcs--jobs)) (neo-vcs--cancel-job job)))
 
 (defun neo-vcs--can-kill ()
@@ -304,9 +335,14 @@ WRITE jobs are never cancelled by refresh or buffer disposal."
 (defun neo-vcs--evil-bind (map)
   "Preserve MAP's pane commands in Evil normal and motion states."
   (when (fboundp 'evil-define-key*)
-    (map-keymap (lambda (event command)
-                 (when (commandp command)
-                   (evil-define-key* '(normal motion) map (vector event) command))) map)))
+    ;; map-keymap also walks parent maps, visiting their bindings last.
+    ;; Import only the pane's own commands, including backend action keys.
+    (let ((bindings (copy-keymap map)))
+      (set-keymap-parent bindings nil)
+      (map-keymap (lambda (event command)
+                    (when (commandp command)
+                      (evil-define-key* '(normal motion) map (vector event) command)))
+                  bindings))))
 
 (with-eval-after-load 'evil
   (mapc #'neo-vcs--evil-bind
@@ -318,16 +354,23 @@ WRITE jobs are never cancelled by refresh or buffer disposal."
                       (string-match-p neo-vcs--filter (plist-get entry :path))))
    (plist-get neo-vcs--state :entries)))
 
+(defun neo-vcs--marked-table ()
+  (let ((table (make-hash-table :test #'equal)))
+    (dolist (path neo-vcs--marked) (puthash path t table))
+    table))
+
 (defun neo-vcs--render ()
-  (let ((id (tabulated-list-get-id)))
-    (setq neo-vcs--marked
-          (cl-intersection neo-vcs--marked
-                           (mapcar (lambda (e) (plist-get e :path))
-                                   (plist-get neo-vcs--state :entries)) :test #'equal))
+  (let ((id (tabulated-list-get-id))
+        (marked (neo-vcs--marked-table)))
+    (when neo-vcs--marked
+      (setq neo-vcs--marked
+            (cl-loop for entry in (plist-get neo-vcs--state :entries)
+                     for path = (plist-get entry :path)
+                     when (gethash path marked) collect path)))
     (setq tabulated-list-entries
           (mapcar (lambda (entry)
                     (let ((path (plist-get entry :path)))
-                      (list path (vector (if (member path neo-vcs--marked) "*" "")
+                      (list path (vector (if (gethash path marked) "*" "")
                                          (symbol-name (or (plist-get entry :status) 'modified))
                                          (neo-vcs--display (plist-get entry :group))
                                          (neo-vcs--display path)))))
@@ -384,6 +427,7 @@ WRITE jobs are never cancelled by refresh or buffer disposal."
           (goto-char (point-min)))))))
 
 (defun neo-vcs--error (text)
+  (neo-vcs--cancel-preview-timer)
   (setq neo-vcs--error text neo-vcs--state nil neo-vcs--history nil)
   (cl-incf neo-vcs--preview-generation)
   (neo-vcs--render)
@@ -415,11 +459,6 @@ WRITE jobs are never cancelled by refresh or buffer disposal."
                    (if (not (eq status 0)) (neo-vcs--error errors)
                      (condition-case failure
                          (progn
-                           (unless (plist-member state :entries) (error "Malformed status response"))
-                           (dolist (entry (plist-get state :entries))
-                             (unless (and (plist-get entry :root-entry)
-                                          (equal (plist-get entry :path) "."))
-                               (neo-vcs--path neo-vcs-context (plist-get entry :path))))
                            (setq neo-vcs--state state)
                            (neo-vcs--render)
                            (neo-vcs--preview)
@@ -440,11 +479,13 @@ WRITE jobs are never cancelled by refresh or buffer disposal."
 
 (defun neo-vcs--selected-entries ()
   (if neo-vcs--marked
-      (cl-remove-if-not (lambda (e) (member (plist-get e :path) neo-vcs--marked))
-                        (neo-vcs--visible-entries))
+      (let ((marked (neo-vcs--marked-table)))
+        (cl-remove-if-not (lambda (e) (gethash (plist-get e :path) marked))
+                          (neo-vcs--visible-entries)))
     (when-let* ((entry (neo-vcs--entry))) (list entry))))
 
 (defun neo-vcs--preview (&optional revision)
+  (neo-vcs--cancel-preview-timer)
   (neo-vcs--cancel-job neo-vcs--preview-job)
   (let* ((target (or revision (neo-vcs--entry)))
          (generation (cl-incf neo-vcs--preview-generation))
@@ -476,14 +517,29 @@ WRITE jobs are never cancelled by refresh or buffer disposal."
                                      (eq status 0)))))))))
       (error (neo-vcs--show-text (concat "Diff unavailable\n" (error-message-string err)))))))
 
-(defun neo-vcs-next () (interactive) (forward-line 1) (when (eobp) (forward-line -1)) (neo-vcs--preview))
-(defun neo-vcs-previous () (interactive) (forward-line -1) (neo-vcs--preview))
+(defun neo-vcs--cancel-preview-timer ()
+  (when neo-vcs--preview-timer
+    (cancel-timer neo-vcs--preview-timer)
+    (setq neo-vcs--preview-timer nil)))
+
+(defun neo-vcs--schedule-preview ()
+  (neo-vcs--cancel-preview-timer)
+  (cl-incf neo-vcs--preview-generation)
+  (let ((owner (current-buffer)))
+    (setq neo-vcs--preview-timer
+          (run-at-time 0.08 nil
+                       (lambda ()
+                         (when (buffer-live-p owner)
+                           (with-current-buffer owner (neo-vcs--preview))))))))
+
+(defun neo-vcs-next () (interactive) (forward-line 1) (when (eobp) (forward-line -1)) (neo-vcs--schedule-preview))
+(defun neo-vcs-previous () (interactive) (forward-line -1) (neo-vcs--schedule-preview))
 (defun neo-vcs-mark ()
   (interactive)
   (when-let* ((id (tabulated-list-get-id)))
-    (setq neo-vcs--marked (if (member id neo-vcs--marked) (delete id neo-vcs--marked)
-                            (cons id neo-vcs--marked)))
-    (neo-vcs--render)))
+    (let ((mark (not (member id neo-vcs--marked))))
+      (setq neo-vcs--marked (if mark (cons id neo-vcs--marked) (delete id neo-vcs--marked)))
+      (tabulated-list-set-col 0 (if mark "*" "") t))))
 (defun neo-vcs-mark-all ()
   (interactive)
   (setq neo-vcs--marked (unless neo-vcs--marked
@@ -498,15 +554,38 @@ WRITE jobs are never cancelled by refresh or buffer disposal."
 
 (defun neo-vcs-focus-list ()
   (interactive)
-  (pop-to-buffer (neo-vcs--owner)))
+  (let* ((owner (neo-vcs--owner))
+         (history-window (buffer-local-value 'neo-git--history-window owner)))
+    ;; A narrow frame shares the lower pane between history and diff.
+    (when (and (window-live-p history-window)
+               (eq (window-buffer history-window) (buffer-local-value 'neo-git--preview-buffer owner)))
+      (set-window-buffer history-window (buffer-local-value 'neo-vcs--history-buffer owner)))
+    (neo-vcs--focus-pane owner (get-buffer-window owner))))
+
+(defun neo-vcs--focus-pane (buffer window)
+  (if (window-live-p window)
+      (progn
+        (set-window-buffer window buffer)
+        (select-window window))
+    (pop-to-buffer buffer)))
+
 (defun neo-vcs-focus-diff ()
   (interactive)
-  (with-current-buffer (neo-vcs--owner)
-    (neo-vcs--preview)
-    (pop-to-buffer neo-git--preview-buffer)))
+  (let* ((owner (neo-vcs--owner))
+         (preview (buffer-local-value 'neo-git--preview-buffer owner))
+         (window (or (get-buffer-window preview)
+                     (buffer-local-value 'neo-git--history-window owner))))
+    (with-current-buffer owner
+      (when (or neo-vcs--preview-timer (not (eq neo-vcs--preview-kind 'file))
+                (not (equal neo-vcs--preview-target (neo-vcs--entry))))
+        (neo-vcs--preview)))
+    (neo-vcs--focus-pane preview window)))
 (defun neo-vcs-focus-history ()
   (interactive)
-  (with-current-buffer (neo-vcs--owner) (pop-to-buffer neo-vcs--history-buffer)))
+  (let* ((owner (neo-vcs--owner))
+         (history (buffer-local-value 'neo-vcs--history-buffer owner))
+         (window (buffer-local-value 'neo-git--history-window owner)))
+    (neo-vcs--focus-pane history window)))
 (defun neo-vcs-show-revision ()
   (interactive)
   (let ((id (tabulated-list-get-id)))
@@ -707,7 +786,8 @@ WRITE jobs are never cancelled by refresh or buffer disposal."
         (use-local-map map)
         (neo-vcs--evil-bind map))
       (unless (buffer-live-p neo-git--preview-buffer)
-        (setq neo-git--preview-buffer (generate-new-buffer (concat name " Diff"))))
+        (setq neo-git--preview-buffer (generate-new-buffer (concat name " Diff")))
+        (neo-vcs--show-text "Loading workspace…\n"))
       (unless (buffer-live-p neo-vcs--history-buffer)
         (setq neo-vcs--history-buffer (generate-new-buffer (concat name " History")))
         (with-current-buffer neo-vcs--history-buffer
