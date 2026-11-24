@@ -337,31 +337,47 @@ and provide optional UTF-8 input.  LOG-ARGUMENTS preserves the Git log format."
          ((string-prefix-p "? " record)
           (push (list :path (substring record 2) :kind 'untracked) entries))
          ((string-prefix-p "u " record)
-          (let ((parts (neo-git--split-fields record 10)))
-            (push (list :path (cdr parts) :kind 'conflict) entries)))
+          (let* ((parts (neo-git--split-fields record 10))
+                 (sub (nth 2 (car parts)))
+                 (entry (list :path (cdr parts) :kind 'conflict)))
+            (when (and (length= sub 4) (= (aref sub 0) ?S))
+              (setq entry (plist-put entry :submodule sub)))
+            (push entry entries)))
          ((string-prefix-p "1 " record)
           (let ((parts (neo-git--split-fields record 8)))
-            (setq entries (neo-git--status-entries (nth 1 (car parts)) (cdr parts) nil entries))))
+            (setq entries (neo-git--status-entries (car parts) (cdr parts) nil entries))))
          ((string-prefix-p "2 " record)
           (let ((parts (neo-git--split-fields record 9)))
-            (setq entries (neo-git--status-entries (nth 1 (car parts)) (cdr parts)
+            (setq entries (neo-git--status-entries (car parts) (cdr parts)
                                                    (pop records) entries)))))))
     (list :branch branch :upstream upstream :oid oid :ahead ahead :behind behind
           :entries (nreverse entries))))
 
-(defun neo-git--status-entries (xy path old-path entries)
-  "Add entries for XY status, preserving both staged and unstaged sides."
-  (let ((index (aref xy 0))
-        (worktree (aref xy 1)))
+(defun neo-git--status-entries (fields path old-path entries)
+  "Add status entries from porcelain FIELDS, preserving both sides."
+  (let* ((xy (nth 1 fields))
+         (index (aref xy 0))
+         (worktree (aref xy 1))
+         (sub (nth 2 fields))
+         (extra (and (length= sub 4) (= (aref sub 0) ?S) (list :submodule sub))))
     (cond
      ((memq ?U (list index worktree))
       (push (list :path path :old-path old-path :kind 'conflict) entries))
      (t
       (unless (eq index ?.)
-        (push (list :path path :old-path old-path :kind 'staged) entries))
+        (push (nconc (list :path path :old-path old-path :kind 'staged) extra) entries))
       (unless (eq worktree ?.)
-        (push (list :path path :old-path old-path :kind 'unstaged) entries))))
+        (push (nconc (list :path path :old-path old-path :kind 'unstaged) extra) entries))))
     entries))
+
+(defun neo-git--submodule-label (entry)
+  (when-let* ((sub (plist-get entry :submodule)))
+    (let ((reasons (if (eq (plist-get entry :kind) 'staged)
+                       '("staged gitlink")
+                     (delq nil (list (and (= (aref sub 1) ?C) "commit changed")
+                                     (and (= (aref sub 2) ?M) "tracked edits")
+                                     (and (= (aref sub 3) ?U) "untracked files"))))))
+      (format "  [submodule%s]" (if reasons (concat ": " (string-join reasons ", ")) "")))))
 
 (defvar neo-git-mode-map
   (let ((map (make-sparse-keymap)))
@@ -703,11 +719,12 @@ and provide optional UTF-8 input.  LOG-ARGUMENTS preserves the Git log format."
                            ('untracked 'neo-git-untracked-face)
                            ('staged 'neo-git-staged-face)
                            ('conflict 'neo-git-conflict-face))))
-              (insert (format "  %-9s %s%s\n" label
+              (insert (format "  %-9s %s%s%s\n" label
                               (neo-git--display-path (plist-get entry :path))
                               (if (plist-get entry :old-path)
                                   (format "  <- %s" (neo-git--display-path (plist-get entry :old-path)))
-                                "")))
+                                "")
+                              (or (neo-git--submodule-label entry) "")))
               (add-text-properties start (point)
                                    `(neo-git-entry ,entry neo-git-group ,kind
                                                    mouse-face highlight face ,face))
@@ -1175,9 +1192,14 @@ and index changes between refreshes, including edits with unchanged mtime."
   (let ((entry (neo-git--entry-at-point)))
     (unless entry
       (user-error "No file selected"))
-    (if (eq (plist-get entry :kind) 'conflict)
-        (neo-git-resolve-conflict)
-      (find-file (expand-file-name (plist-get entry :path) neo-git-root)))))
+    (let ((path (expand-file-name (plist-get entry :path) neo-git-root)))
+      (cond
+       ((plist-get entry :submodule)
+        (unless (and (file-directory-p path) (file-exists-p (expand-file-name ".git" path)))
+          (user-error "Submodule is not checked out: %s" path))
+        (let ((default-directory (file-name-as-directory path))) (neo-git--status-git)))
+       ((eq (plist-get entry :kind) 'conflict) (neo-git-resolve-conflict))
+       (t (find-file path))))))
 
 (defvar-local neo-git--conflict-owner nil)
 (defvar neo-git-conflict-mode-map
@@ -2410,6 +2432,17 @@ Unstaged files are restored from the index; untracked files are deleted."
     (neo-git--mutate (list "commit" (concat "--fixup=" oid) "--no-edit")
                      (concat "fixup " (substring oid 0 8)))))
 
+(defun neo-git--commit-ident (root variable)
+  "Read the effective name and email for Git identity VARIABLE in ROOT."
+  (with-temp-buffer
+    (let ((coding-system-for-read 'utf-8-unix))
+      (if (and (equal 0 (process-file (neo-git--executable) nil '(t nil) nil
+                                      "-C" root "var" variable))
+               (progn (goto-char (point-min))
+                      (re-search-forward "^\\(.+>\\) [-0-9]+ [+-][0-9]+$" nil t)))
+          (match-string-no-properties 1)
+        "unavailable"))))
+
 (defun neo-git-commit (&optional kind)
   "Edit a new commit message, or amend/reword HEAD according to KIND."
   (interactive)
@@ -2422,6 +2455,8 @@ Unstaged files are restored from the index; untracked files are deleted."
                                        (eq (plist-get e :kind) 'staged)) neo-git-entries)))
     (user-error "Stage changes before committing"))
   (let* ((status-buffer (current-buffer))
+         (root neo-git-root)
+         (ordinary (not (or kind (neo-git--in-progress-p))))
          (head (and kind (neo-git--commit-head)))
          (staged (seq-filter (lambda (e) (eq (plist-get e :kind) 'staged)) neo-git-entries))
          (buffer (get-buffer-create (format "*Neo Git Commit %s: %s*" (or kind 'new)
@@ -2446,7 +2481,11 @@ Unstaged files are restored from the index; untracked files are deleted."
         (skip-chars-backward " \t\n")
         (delete-region (point) (point-max))
         (insert "\n\n# Lines starting with '#' are ignored.\n"
-                (if (eq kind 'reword) "# Message only; staged changes remain staged.\n"
+                "# Repository: " (neo-git--display-path root) "\n")
+        (when ordinary
+          (insert "# Author: " (neo-git--commit-ident root "GIT_AUTHOR_IDENT") "\n"
+                  "# Committer: " (neo-git--commit-ident root "GIT_COMMITTER_IDENT") "\n"))
+        (insert (if (eq kind 'reword) "# Message only; staged changes remain staged.\n"
                   "# Changes to be committed:\n"))
         (dolist (entry (unless (eq kind 'reword) staged))
           (insert "#\t" (if (plist-get entry :old-path)
