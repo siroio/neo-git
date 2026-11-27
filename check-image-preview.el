@@ -49,6 +49,53 @@
                             "CHNKSQLi" (funcall uint64 (length bytes)) bytes
                             "CHNKFoot" (funcall uint64 0)) nil "drawing.clip" nil 'silent))))
 
+(ert-deftest neo-git-image-windows-without-magick-and-cache-invalidation ()
+  (skip-unless (neo-git--wic-directory))
+  (let* ((root (file-name-as-directory (make-temp-file "neo-git-image-cache-" t)))
+         (default-directory root)
+         (preview (generate-new-buffer " *image-cache-preview*"))
+         (owner (generate-new-buffer " *image-cache-owner*"))
+         (plain "iVBORw0KGgoAAAANSUhEUgAAAAQAAAACCAIAAADwyuo0AAAAEElEQVQI12P8z4AATEhsBgAZNQED0EYliAAAAABJRU5ErkJggg==")
+         (dot "iVBORw0KGgoAAAANSUhEUgAAAAQAAAACCAIAAADwyuo0AAAAGUlEQVQI10XBsQEAAAjDIPL/0XUUYhPQvAM5HAMBYSALqwAAAABJRU5ErkJggg==")
+         (lookup (symbol-function 'executable-find))
+         (loader (symbol-function 'neo-git--load-image))
+         (loads 0))
+    (unwind-protect
+        (with-current-buffer owner
+          (neo-git-mode)
+          (setq default-directory root neo-git-root root neo-git--preview-buffer preview)
+          (cl-letf (((symbol-function 'executable-find)
+                     (lambda (program &rest args) (unless (equal program "magick") (apply lookup program args))))
+                    ((symbol-function 'display-images-p) (lambda (&rest _) t))
+                    ((symbol-function 'neo-git--entry-at-point) (lambda () '(:path "x.png" :kind unstaged)))
+                    ((symbol-function 'neo-git--load-image)
+                     (lambda (&rest args) (cl-incf loads) (apply loader args))))
+            (cl-labels ((write-png (data)
+                          (let ((coding-system-for-write 'no-conversion))
+                            (write-region (base64-decode-string data) nil "x.png" nil 'silent)))
+                        (compare-png (expected)
+                          (neo-git--preview-selected)
+                          (neo-git-image-check--wait owner)
+                          (with-current-buffer preview
+                            (ert-info ((buffer-string)) (should (string-search expected (buffer-string)))))))
+              (neo-git-image-check--run "git" "init" "-q")
+              (write-png plain)
+              (neo-git-image-check--run "git" "add" "--" "x.png")
+              (write-png dot)
+              (compare-png "1 changed pixel")
+              (compare-png "1 changed pixel")
+              (let ((previous loads)
+                    (mtime (file-attribute-modification-time (file-attributes "x.png"))))
+                (compare-png "1 changed pixel")
+                (should (= previous loads))
+                (write-png plain)
+                (set-file-times "x.png" mtime)
+                (compare-png "0 changed pixels")
+                (write-png dot)
+                (neo-git-image-check--run "git" "add" "--" "x.png")
+                (compare-png "0 changed pixels")))))
+      (kill-buffer owner) (kill-buffer preview) (delete-directory root t))))
+
 (ert-deftest neo-git-image-preview-formats-and-git-versions ()
   (skip-unless (and (executable-find "magick") (sqlite-available-p)))
   (let* ((root (file-name-as-directory (make-temp-file "neo-git-art-test-" t)))
@@ -101,7 +148,9 @@
                 (select-image name 'unstaged)
                 (should (= 7 (neo-git-image-check--width preview)))
                 (with-current-buffer preview
-                  (should (string-search "Pixel comparison requires ImageMagick" (buffer-string))))))
+                  (should (string-search (if (neo-git--wic-directory)
+                                             "8 changed pixels" "Pixel comparison requires")
+                                         (buffer-string))))))
             ;; Moving away while conversion runs must only publish the latest row.
             (with-current-buffer owner
               (cl-letf (((symbol-function 'neo-git--entry-at-point)
@@ -171,8 +220,8 @@
                  (neo-git-image-check--clip image-path)
                  (delete-file "source.sqlite")
                  (dolist (file '("art.psd" "art.psb"))
-                   (neo-git-image-check--run "magick" image-path "-type" "TrueColor" "-depth" "8"
-                                             "-compress" "none" file))
+                  (neo-git-image-check--run "magick" image-path "-type" "TrueColor" "-depth" "8"
+                                             "-compress" (if (equal file "art.psb") "RLE" "none") file))
                  (neo-git-image-check--run "git" "add" "--" image-path "drawing.clip" "art.psd" "art.psb"))
                (status-diff (path kind)
                  (let* ((state (neo-git--parse-status
@@ -221,10 +270,24 @@
             (neo-git-image-check--run "magick" image-path "-alpha" "set" "-channel" "A" "-evaluate"
                                       "set" "50%" "+channel" "-background" "none" "-gravity" "NorthWest"
                                       "-extent" "5x2" image-path)
-            (dolist (file (list image-path "drawing.clip" "art.psd" "art.psb"))
-              (status-diff file 'staged)
-              (check-text preview "1 changed pixel  |  4x2 -> 4x2")
-              (should (= 4 (neo-git-image-check--width preview))))
+            (let ((find-program (symbol-function 'executable-find))
+                  (native (neo-git--wic-directory)))
+              (cl-letf (((symbol-function 'executable-find)
+                         (lambda (cmd &rest args)
+                           (unless (and native (equal cmd "magick")) (apply find-program cmd args)))))
+                (dolist (file (list image-path "drawing.clip" "art.psd" "art.psb"))
+                  (status-diff file 'staged)
+                  (check-text preview "1 changed pixel  |  4x2 -> 4x2")
+                  (should (= 4 (neo-git-image-check--width preview))))
+                (dolist (file '("alpha.psd" "alpha.psb"))
+                  (neo-git-image-check--run "magick" "-size" "4x2" "xc:rgba(32,80,148,.5)"
+                                            "-type" "TrueColorAlpha" "-depth" "8" "-compress" "RLE" file)
+                  (neo-git-image-check--run "git" "add" "--" file)
+                  (neo-git-image-check--run "magick" "-size" "4x2" "xc:rgba(32,80,148,.5)"
+                                            "-fill" "white" "-draw" "point 0,0"
+                                            "-type" "TrueColorAlpha" "-depth" "8" "-compress" "RLE" file)
+                  (status-diff file 'unstaged)
+                  (check-text preview "1 changed pixel  |  4x2 -> 4x2"))))
             ;; Check the mask itself, including an unchanged neighbor.
             (with-current-buffer preview
               (let* ((pos (text-property-not-all (point-min) (point-max) 'display nil))
@@ -269,6 +332,14 @@
             (neo-git-image-check--run "magick" "wide.png" "-fill" "blue" "-draw" "point 2399,3" "wide.png")
             (status-diff "wide.png" 'unstaged)
             (check-text preview "1 changed pixel  |  2400x4 -> 2400x4")
+            ;; AE is fractional for these two colors even though all 400 pixels changed.
+            (neo-git-image-check--run "magick" "-size" "20x20" "xc:rgba(0,0,23,.75)" "metric.png")
+            (neo-git-image-check--run "git" "add" "--" "metric.png")
+            (neo-git-image-check--run "magick" "-size" "20x20" "xc:rgba(255,23,0,.75)" "metric.png")
+            (dolist (compiler (delete-dups (list neo-git--wic-compiler nil)))
+              (let ((neo-git--wic-compiler compiler))
+                (status-diff "metric.png" 'unstaged)
+                (check-text preview "400 changed pixels  |  20x20 -> 20x20")))
             ;; Materialize two unmerged index stages without invoking a merge driver.
             (let ((ours (neo-git-image-check--run "git" "rev-parse" "HEAD:wide.png"))
                   (theirs (neo-git-image-check--run "git" "hash-object" "-w" "wide.png")))
