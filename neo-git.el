@@ -653,6 +653,13 @@ and provide optional UTF-8 input.  LOG-ARGUMENTS preserves the Git log format."
             (setq index (1+ index))))))
     found))
 
+(defun neo-git--upstream-summary (state)
+  "Return the upstream name and available ahead/behind counts for STATE."
+  (when-let* ((upstream (plist-get state :upstream)))
+    (concat " → " upstream
+            (when (integerp (plist-get state :ahead))
+              (format "  ↑%d ↓%d" (plist-get state :ahead) (plist-get state :behind))))))
+
 (defun neo-git--render (&optional selected)
   (let* ((inhibit-read-only t)
         (old (or selected (neo-git--entry-at-point)
@@ -677,11 +684,7 @@ and provide optional UTF-8 input.  LOG-ARGUMENTS preserves the Git log format."
       (insert (if neo-git--status-error "unavailable"
                 (or (plist-get neo-git-state :branch) "detached/unborn")))
       (add-text-properties branch-start (point) '(face neo-git-branch-face)))
-    (insert (if (plist-get neo-git-state :upstream)
-                (concat " → " (plist-get neo-git-state :upstream)) ""))
-    (insert (if (integerp (plist-get neo-git-state :ahead))
-                (format "  ↑%d ↓%d" (plist-get neo-git-state :ahead)
-                        (plist-get neo-git-state :behind)) ""))
+    (insert (or (neo-git--upstream-summary neo-git-state) ""))
     (insert (if neo-git--mutation
                 (format "  [%s running]" (or neo-git--mutation-label "Git operation")) ""))
     (insert (if neo-git--narrow "  [search filtered]" "") "\n\n")
@@ -2833,7 +2836,7 @@ C-c C-c saves and continues; C-c C-k cancels this editor invocation."
     "refs/heads/" "refs/remotes/")
   "`for-each-ref' arguments listing local, then remote branches.")
 
-(defvar-local neo-git--history-all nil
+(defvar-local neo-git--history-all t
   "Non-nil when the history pane shows all branches, remotes and tags.")
 (defvar-local neo-git--browser-process nil)
 (defvar-local neo-git--browser-generation 0)
@@ -2859,6 +2862,10 @@ C-c C-c saves and continues; C-c C-k cancels this editor invocation."
 
 (defface neo-git-ref-face '((t (:inherit font-lock-constant-face :weight bold)))
   "Face for branch and tag names in Neo Git history."
+  :group 'neo-git)
+
+(defface neo-git-remote-ref-face '((t (:inherit font-lock-type-face :weight bold)))
+  "Face for remote-tracking branches in Neo Git history."
   :group 'neo-git)
 
 (define-derived-mode neo-git-browser-mode tabulated-list-mode "Neo-Git-Browse"
@@ -2979,6 +2986,20 @@ RESUME permits a merge/rebase in progress, for continuing or aborting it."
                   " "))
               cells "")))
 
+(defun neo-git--history-ref-label (ref)
+  "Format one full Git decoration REF for a commit row."
+  (cond
+   ((string-prefix-p "HEAD -> refs/heads/" ref)
+    (propertize (concat "HEAD -> " (string-remove-prefix "HEAD -> refs/heads/" ref))
+                'face 'neo-git-branch-face))
+   ((equal ref "HEAD") (propertize ref 'face 'neo-git-branch-face))
+   ((string-prefix-p "refs/remotes/" ref)
+    (propertize (string-remove-prefix "refs/remotes/" ref) 'face 'neo-git-remote-ref-face))
+   ((string-prefix-p "tag: refs/tags/" ref)
+    (propertize (concat "tag: " (string-remove-prefix "tag: refs/tags/" ref))
+                'face 'neo-git-ref-face))
+   (t (propertize (string-remove-prefix "refs/heads/" ref) 'face 'neo-git-ref-face))))
+
 (defun neo-git--history-entries (output)
   "Parse `git log' OUTPUT of id, parents and columns into graph entries.
 One row per commit: ● commit, ○ merge, <─┐ merged branch, ─┘ fork point."
@@ -3041,7 +3062,8 @@ One row per commit: ● commit, ○ merge, <─┐ merged branch, ─┘ fork po
                                 (neo-git--graph-string cells)
                                 date
                                 (concat (unless (string-empty-p refs)
-                                          (propertize (format "(%s) " refs) 'face 'neo-git-ref-face))
+                                          (concat "(" (mapconcat #'neo-git--history-ref-label
+                                                                 (split-string refs ", ") ", ") ") "))
                                         (string-join subject " "))))
                   rows))
           (while (and lanes (null (car (last lanes))))
@@ -3052,7 +3074,7 @@ One row per commit: ● commit, ○ merge, <─┐ merged branch, ─┘ fork po
     rows))
 
 (defun neo-git-history ()
-  "Show the latest 100 commits on the current branch with their graph."
+  "Show up to 100 commits in a graph including remote-tracking branches."
   (interactive)
   (neo-git--browse 'history))
 
@@ -3067,6 +3089,17 @@ One row per commit: ● commit, ○ merge, <─┐ merged branch, ─┘ fork po
   (unless (eq neo-git--browser-kind 'history) (user-error "Open the history first"))
   (setq neo-git--history-all (not neo-git--history-all))
   (neo-git-browser-refresh))
+
+(defun neo-git--history-header-line ()
+  "Show history scope and the current branch's upstream status."
+  (let* ((state (and (buffer-live-p neo-git--diff-owner)
+                     (buffer-local-value 'neo-git-state neo-git--diff-owner)))
+         (tracking (neo-git--upstream-summary state)))
+    (neo-git--mode-line-literal
+     (concat " " (when tracking (concat (plist-get state :branch) tracking "  |  "))
+             (if neo-git--history-all "All branches" "Current branch")
+             ", latest 100  RET: diff  a: all/current  B: branch here"
+             "  C: cherry-pick  q/TAB: list"))))
 
 (defun neo-git--branch-entries (output)
   "Parse `neo-git--branch-format' OUTPUT into tabulated entries, skipping symrefs."
@@ -3085,8 +3118,12 @@ One row per commit: ● commit, ○ merge, <─┐ merged branch, ─┘ fork po
   (interactive)
   (neo-git--browse 'stash))
 
-(defun neo-git-browser-refresh ()
-  (interactive)
+(defun neo-git-browser-refresh (&optional refresh-tracking)
+  "Refresh the browser and, when interactive, its owner's tracking counts."
+  (interactive (list t))
+  (when (and refresh-tracking (eq neo-git--browser-kind 'history)
+             (buffer-live-p neo-git--diff-owner))
+    (with-current-buffer neo-git--diff-owner (neo-git-refresh)))
   (let ((buffer (current-buffer))
         (generation (cl-incf neo-git--browser-generation)))
     (when (process-live-p neo-git--browser-process)
@@ -3096,9 +3133,11 @@ One row per commit: ● commit, ○ merge, <─┐ merged branch, ─┘ fork po
           (neo-git--run
            neo-git-root
            (pcase neo-git--browser-kind
-             ('history (append '("log" "--topo-order" "-100" "--date=short" "--color=never"
+             ('history (append '("log" "--topo-order" "-100" "--date=short"
+                                 "--color=never" "--decorate=full"
                                  "--format=%H%x1f%P%x1f%h%x1f%ad%x1f%an%x1f%D%x1f%s")
-                               (when neo-git--history-all '("--branches" "--remotes" "--tags"))))
+                               (when neo-git--history-all
+                                 '("--branches" "--remotes" "--tags" "--ignore-missing" "HEAD" "--"))))
              ('branches (cons "for-each-ref" neo-git--branch-format))
              ('reflog '("reflog" "-100" "--format=%H%x09%gd%x09%gs"))
              (_ '("stash" "list" "--format=%H%x09%gd%x09%gs")))
@@ -3133,9 +3172,7 @@ One row per commit: ● commit, ○ merge, <─┐ merged branch, ─┘ fork po
                                  ('stash " SPC: apply (keep stash)  RET: diff  d: delete  r: refresh  q: back")
                                  ('branches " SPC: switch  B: new from  R: rename local  d: delete  D: force local  RET: diff  q: back")
                                  ('reflog " Reflog: RET: diff  B: recovery branch  z: recovery menu  q: back")
-                                 (_ (concat (if neo-git--history-all " All branches" " Current branch")
-                                            ", latest 100  RET: diff  a: all/current  B: branch here"
-                                            "  C: cherry-pick  q/TAB: list")))
+                                 (_ '(:eval (neo-git--history-header-line))))
                              " No entries  r: refresh  q: back"))
                      (tabulated-list-print t))))))))))
 

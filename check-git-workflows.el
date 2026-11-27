@@ -39,6 +39,7 @@
         (with-temp-file "side.txt" (insert "side\n"))
         (neo-git-workflow-output root "add" "side.txt")
         (neo-git-workflow-output root "commit" "-qm" "side work")
+        (neo-git-workflow-output root "tag" "v1")
         (neo-git-workflow-output root "switch" "-q" "main")
         (neo-git-workflow-output root "merge" "-q" "--no-ff" "-m" "merge side" "side")
         (with-current-buffer owner
@@ -63,6 +64,7 @@
           ;; which forks off the initial commit.
           (cl-assert (string-match-p "^.*○<┐.*(HEAD -> main) merge side" (buffer-string)))
           (cl-assert (string-match-p "^.*│ ●.*side work" (buffer-string)))
+          (cl-assert (string-match-p "tag: v1" (buffer-string)))
           (cl-assert (string-match-p "^.*●─┘.*initial" (buffer-string)))
           (cl-assert (= 3 (length tabulated-list-entries)))
           (cl-assert (seq-every-p #'car tabulated-list-entries))
@@ -219,17 +221,36 @@
           (neo-git-workflow-wait (lambda () (not neo-git--mutation))))
         (neo-git-workflow-output root "merge-base" "--is-ancestor" "main" "HEAD")
         (neo-git-workflow-output root "switch" "-q" "main")
-        ;; History can include commits of every branch.
-        (with-current-buffer history
-          (cl-assert (not (string-match-p "pick me" (buffer-string))))
-          (neo-git-history-toggle-all)
-          (neo-git-workflow-wait (lambda () (string-match-p "pick me" (buffer-string))))
-          (neo-git-history-toggle-all)
-          (neo-git-workflow-wait (lambda () (not (string-match-p "pick me" (buffer-string))))))
-        ;; Branch list: current marker, remote rows, rename, delete and creation from a row.
+        ;; Fetch through the UI, then leave a divergent tip only on the remote.
         (neo-git-workflow-output root "remote" "add" "origin" root)
-        (neo-git-workflow-output root "fetch" "-q" "origin")
+        (with-current-buffer owner
+          (cl-letf (((symbol-function 'completing-read) (lambda (&rest _) "origin")))
+            (neo-git-fetch)))
+        (neo-git-workflow-wait
+         (lambda () (with-current-buffer history (string-match-p "origin/pick" (buffer-string)))))
         (neo-git-workflow-output root "branch" "-qD" "pick")
+        (neo-git-workflow-output root "branch" "--set-upstream-to=origin/pick" "main")
+        (let* ((remote-tip (neo-git-workflow-output root "rev-parse" "origin/pick"))
+               (counts (split-string (neo-git-workflow-output
+                                      root "rev-list" "--left-right" "--count" "HEAD...origin/pick"))))
+          (with-current-buffer history
+            (call-interactively #'neo-git-browser-refresh)
+            (neo-git-workflow-wait
+             (lambda () (and (not neo-git--browser-process)
+                             (string-match-p (format "main → origin/pick  ↑%s ↓%s"
+                                                     (car counts) (cadr counts))
+                                             (neo-git--history-header-line))
+                             (string-match-p "(origin/pick) pick me" (buffer-string)))))
+            (cl-assert (equal header-line-format '(:eval (neo-git--history-header-line))))
+            (let ((subject (aref (cadr (assoc remote-tip tabulated-list-entries)) 4)))
+              (cl-assert (eq (get-text-property 1 'face subject) 'neo-git-remote-ref-face)))
+            (neo-git-history-toggle-all)
+            (neo-git-workflow-wait (lambda () (not neo-git--browser-process)))
+            (cl-assert (not (assoc remote-tip tabulated-list-entries)))
+            (neo-git-history-toggle-all)
+            (neo-git-workflow-wait (lambda () (not neo-git--browser-process)))
+            (cl-assert (assoc remote-tip tabulated-list-entries))))
+        ;; Branch list: current marker, remote rows, rename, delete and creation from a row.
         (let (branches)
           (with-current-buffer owner
             (cl-letf (((symbol-function 'pop-to-buffer) #'set-buffer)) (neo-git-branch-list))
@@ -293,6 +314,13 @@
                         (and (not neo-git--browser-process)
                              (not (assoc "refs/heads/topic" tabulated-list-entries))))))
           (kill-buffer branches))
+        ;; A detached commit can be absent from every branch and tag.
+        (neo-git-workflow-output root "switch" "-q" "--detach")
+        (neo-git-workflow-output root "commit" "--allow-empty" "-qm" "detached tip")
+        (with-current-buffer history
+          (neo-git-browser-refresh)
+          (neo-git-workflow-wait (lambda () (not neo-git--browser-process)))
+          (cl-assert (string-match-p "(HEAD) detached tip" (buffer-string))))
         (princ "NEO_GIT_WORKFLOWS=PASS\n"))
     (dolist (buffer (list file-buffer history stash preview owner))
       (when (buffer-live-p buffer)
