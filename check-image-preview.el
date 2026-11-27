@@ -1,0 +1,143 @@
+;;; check-image-preview.el --- Binary preview checks -*- lexical-binding: t; -*-
+
+(require 'ert)
+(require 'cl-lib)
+(load (expand-file-name "neo-git.el" (file-name-directory load-file-name)) nil t)
+
+(defun neo-git-image-check--run (program &rest arguments)
+  (with-temp-buffer
+    (let ((coding-system-for-read 'utf-8-unix)
+          (coding-system-for-write (if (eq system-type 'windows-nt)
+                                       w32-system-coding-system 'utf-8-unix)))
+      (unless (zerop (apply #'process-file program nil t nil arguments))
+        (error "%s: %s" program (buffer-string)))
+      (string-trim (buffer-string)))))
+
+(defun neo-git-image-check--wait (source)
+  (let ((deadline (+ (float-time) 20)))
+    (while (and (buffer-local-value 'neo-git--diff-process source) (< (float-time) deadline))
+      (accept-process-output nil 0.03))
+    (should-not (buffer-local-value 'neo-git--diff-process source))))
+
+(defun neo-git-image-check--width (preview)
+  (with-current-buffer preview
+    (let* ((pos (text-property-not-all (point-min) (point-max) 'display nil))
+           (img (and pos (get-text-property pos 'display)))
+           (data (plist-get (cdr img) :data)))
+      (ert-info ((buffer-string))
+        (should (stringp data))
+        (should (equal (substring data 1 4) "PNG"))
+        (when (display-graphic-p)
+          (should (> (car (image-size img t)) 0)))
+        (aref data 19)))))
+
+(defun neo-git-image-check--clip (png)
+  (let* ((db (sqlite-open (expand-file-name "source.sqlite")))
+         (data (neo-git--image-bytes png))
+         (coding-system-for-write 'no-conversion))
+    (unwind-protect
+        (progn
+          (sqlite-execute db "CREATE TABLE CanvasPreview (ImageData BLOB)")
+          (sqlite-execute db (format "INSERT INTO CanvasPreview VALUES (X'%s')"
+                                     (mapconcat (lambda (b) (format "%02x" b)) data ""))))
+      (sqlite-close db))
+    (let* ((bytes (neo-git--image-bytes "source.sqlite"))
+           (uint64 (lambda (n) (apply #'unibyte-string
+                                      (cl-loop for shift from 56 downto 0 by 8
+                                               collect (logand (ash n (- shift)) 255))))))
+      (write-region (concat "CSFCHUNK" (funcall uint64 (+ 56 (length bytes))) (funcall uint64 24)
+                            "CHNKSQLi" (funcall uint64 (length bytes)) bytes
+                            "CHNKFoot" (funcall uint64 0)) nil "drawing.clip" nil 'silent))))
+
+(ert-deftest neo-git-image-preview-formats-and-git-versions ()
+  (skip-unless (and (executable-find "magick") (sqlite-available-p)))
+  (let* ((root (file-name-as-directory (make-temp-file "neo-git-art-test-" t)))
+         (default-directory root)
+         (owner (generate-new-buffer " *image-status*"))
+         (preview (generate-new-buffer " *image-preview*"))
+         (name "絵 [1].PNG")
+         (display-test (if (display-graphic-p) (symbol-function 'display-images-p)
+                         (lambda (&rest _) t)))
+         history)
+    (unwind-protect
+        (cl-letf (((symbol-function 'display-images-p) display-test))
+          (neo-git-image-check--run "git" "init" "-q")
+          (with-current-buffer owner
+            (neo-git-mode)
+            (setq neo-git-root root neo-git--preview-buffer preview))
+          (cl-labels
+              ((select-image (path kind)
+                 (let* ((state (neo-git--parse-status
+                                (neo-git-image-check--run "git" "status" "--porcelain=v2" "-z")))
+                        (entry (seq-find (lambda (row) (and (equal (plist-get row :path) path)
+                                                           (eq (plist-get row :kind) kind)))
+                                         (plist-get state :entries))))
+                   (should entry)
+                   (with-current-buffer owner
+                     (cl-letf (((symbol-function 'neo-git--entry-at-point) (lambda () entry)))
+                       (neo-git--preview-selected))))
+                 (neo-git-image-check--wait owner))
+               (make-image-file (width path)
+                 (neo-git-image-check--run "magick" "-size" (format "%dx4" width)
+                                           "xc:red" "-type" "TrueColor" path))
+               (commit (message)
+                 (neo-git-image-check--run "git" "-c" "user.name=Test"
+                                           "-c" "user.email=test@example.invalid"
+                                           "-c" "commit.gpgsign=false" "commit" "-qm" message)))
+            (make-image-file 3 name)
+            (neo-git-image-check--run "git" "add" "--" name)
+            (commit "first image")
+            (make-image-file 5 name)
+            (neo-git-image-check--run "git" "add" "--" name)
+            (make-image-file 7 name)
+            (select-image name 'staged)
+            (should (= 5 (neo-git-image-check--width preview)))
+            (select-image name 'unstaged)
+            (should (= 7 (neo-git-image-check--width preview)))
+            (let ((find-program (symbol-function 'executable-find)))
+              (cl-letf (((symbol-function 'executable-find)
+                         (lambda (program &rest args)
+                           (unless (equal program "magick") (apply find-program program args)))))
+                (select-image name 'unstaged)
+                (should (= 7 (neo-git-image-check--width preview)))))
+            ;; Moving away while conversion runs must only publish the latest row.
+            (with-current-buffer owner
+              (cl-letf (((symbol-function 'neo-git--entry-at-point)
+                         (lambda () (list :path name :kind 'staged))))
+                (neo-git--preview-selected)))
+            (select-image name 'unstaged)
+            (should (= 7 (neo-git-image-check--width preview)))
+            (when (executable-find "git-lfs")
+              (with-temp-buffer
+                (should (eq 0 (process-file "git-lfs" (expand-file-name name) t nil "clean" "--" "art.png")))
+                (write-region (point-min) (point-max) "art.png" nil 'silent))
+              (select-image "art.png" 'untracked)
+              (should (= 7 (neo-git-image-check--width preview))))
+            (neo-git-image-check--clip name)
+            (copy-file "drawing.clip" "alias.clpi")
+            (dolist (path '("drawing.clip" "alias.clpi" "photo.psd" "poster.psb"))
+              (when (member path '("photo.psd" "poster.psb")) (make-image-file 7 path))
+              (select-image path 'untracked)
+              (should (= 7 (neo-git-image-check--width preview))))
+            (with-temp-file "invalid.clpi" (insert "HDMV0200"))
+            (select-image "invalid.clpi" 'untracked)
+            (with-current-buffer preview
+              (should (string-match-p "not a CLIP STUDIO" (buffer-string)))
+              (should-not (text-property-not-all (point-min) (point-max) 'display nil)))
+            (delete-file name)
+            (select-image name 'unstaged)
+            (should (= 5 (neo-git-image-check--width preview)))
+            (neo-git-image-check--run "git" "add" "-u")
+            (select-image name 'staged)
+            (should (= 3 (neo-git-image-check--width preview)))
+            (commit "delete image")
+            (let ((oid (neo-git-image-check--run "git" "rev-parse" "HEAD")))
+              (with-temp-buffer
+                (setq neo-git--browser-kind 'history neo-git-root root neo-git--diff-owner owner)
+                (cl-letf (((symbol-function 'tabulated-list-get-id) (lambda () oid))
+                          ((symbol-function 'pop-to-buffer) (lambda (b &rest _) (setq history b))))
+                  (neo-git-history-image)))
+              (neo-git-image-check--wait history)
+              (should (= 3 (neo-git-image-check--width history))))))
+      (dolist (buffer (list owner preview history)) (when (buffer-live-p buffer) (kill-buffer buffer)))
+      (delete-directory root t))))

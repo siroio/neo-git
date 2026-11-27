@@ -122,6 +122,16 @@ Gitの履歴は、ローカルブランチ・リモート追跡ブランチ・�
 
 上流ブランチを設定している場合、履歴の見出しに `main → origin/main  ↑2 ↓1` のように表示します。この例では、ローカルだけにあるコミットが2件、上流だけにあるコミットが1件です。リモートの最新状態を取得するには、変更一覧で `f` を押してリモートを選びます。fetchが終わると履歴も更新されます。
 
+### 画像のプレビュー
+
+GUI版Emacsの変更一覧で画像を選ぶと、差分ペインに表示します。未ステージの行は作業ファイル、ステージ済みの行はインデックスの画像を表示します。削除した画像は削除前の版を確認できます。コミット履歴では画像を変更したコミットにカーソルを合わせて `i` を押します。対象が複数あればファイル名を選べます。
+
+- PNG、JPEG、GIF、WebP、BMP、TIFF に対応します。ImageMagick 7 の `magick` が PATH にある場合は先頭の画像を最大1200×900に縮小します。未導入の場合は、16 MiBまでの画像をEmacsの対応デコーダーで表示します。
+- Photoshopの `.psd` と `.psb` は `magick` で合成画像を表示します。
+- CLIP STUDIO PAINTの `.clip` は、SQLite対応のEmacsでファイルに保存されたキャンバスプレビューを表示します。`.clpi` も中身が同じCLIP形式なら表示できます。
+
+Git LFSで管理している画像は、作業ファイルまたはローカルのLFSキャッシュにある実体を使います。必要な画像が手元にない場合は、差分ペインにその旨を表示します。
+
 コミットの作者は対象リポジトリの Git 設定に従います。`neo-emacs` と併用する場合、`,` は既存の `neo-leader-map` に接続します。
 
 リモートブランチの`d`は、確認後にサーバー側のブランチを削除します。同名のローカルブランチは残ります。最後のfetchからリモート側で更新されていた場合は削除を拒否するため、fetchして内容を確認してから再試行してください。標準のfetch設定（`+refs/heads/*:refs/remotes/<remote>/*`）に対応します。
@@ -153,6 +163,7 @@ emacs -Q --batch -l check-navigation.el
 emacs -Q --batch -l check-remote-delete.el
 emacs -Q --batch -l check-cleanup.el
 emacs -Q --batch -L . -l check-diff-display.el -f ert-run-tests-batch-and-exit
+emacs -Q --batch -L . -l check-image-preview.el -f ert-run-tests-batch-and-exit
 emacs -Q --batch -L . -l check-diff-performance.el -f ert-run-tests-batch-and-exit
 emacs -Q --batch -l check-vcs-package.el
 emacs -Q --batch -L . -l check-vcs.el -l check-vcs-integration.el -l check-vcs-jj.el -l check-vcs-hg.el -l check-vcs-svn.el -l check-vcs-p4.el -f ert-run-tests-batch-and-exit

@@ -365,9 +365,11 @@ and provide optional UTF-8 input.  LOG-ARGUMENTS preserves the Git log format."
       (push (list :path path :old-path old-path :kind 'conflict) entries))
      (t
       (unless (eq index ?.)
-        (push (nconc (list :path path :old-path old-path :kind 'staged) extra) entries))
+        (push (append (list :path path :old-path old-path :kind 'staged)
+                      (when (= index ?D) '(:deleted t)) extra) entries))
       (unless (eq worktree ?.)
-        (push (nconc (list :path path :old-path old-path :kind 'unstaged) extra) entries))))
+        (push (append (list :path path :old-path old-path :kind 'unstaged)
+                      (when (= worktree ?D) '(:deleted t)) extra) entries))))
     entries))
 
 (defun neo-git--submodule-label (entry)
@@ -997,12 +999,185 @@ and index changes between refreshes, including edits with unchanged mtime."
                   (file-modes file) attributes)))
       (file-error nil))))
 
+(defconst neo-git--image-library (or load-file-name buffer-file-name (locate-library "neo-git")))
+
+(defconst neo-git--image-formats
+  '(("png" . "PNG") ("jpg" . "JPEG") ("jpeg" . "JPEG") ("gif" . "GIF")
+    ("webp" . "WEBP") ("bmp" . "BMP") ("tif" . "TIFF") ("tiff" . "TIFF")
+    ("psd" . "PSD") ("psb" . "PSB") ("clip" . "CLIP") ("clpi" . "CLIP")))
+
+(defun neo-git--image-format (path)
+  (cdr (assoc-string (or (file-name-extension path) "") neo-git--image-formats t)))
+
+(defun neo-git--image-bytes (file &optional start end)
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (insert-file-contents-literally file nil start end)
+    (buffer-string)))
+
+(defun neo-git--image-lfs-file (git file)
+  "Return FILE or the locally cached object identified by its LFS pointer."
+  (let ((header (neo-git--image-bytes file 0 1024)))
+    (if (not (string-prefix-p "version https://git-lfs.github.com/spec/v1" header)) file
+      (unless (string-match "^oid sha256:\\([0-9a-f]\\{64\\}\\)\r?$" header)
+        (error "Invalid Git LFS pointer"))
+      (let ((oid (match-string 1 header)))
+        (with-temp-buffer
+          (let ((coding-system-for-read 'utf-8-unix))
+            (unless (and (eq 0 (call-process git nil t nil "lfs" "env"))
+                         (progn (goto-char (point-min)) (re-search-forward "^LocalMediaDir=\\(.+\\)$" nil t)))
+              (error "Cannot locate the local Git LFS cache")))
+          (let* ((media (string-trim-right (match-string 1)))
+                 (object (expand-file-name (format "%s/%s/%s" (substring oid 0 2) (substring oid 2 4) oid)
+                                           media)))
+            (unless (file-readable-p object) (error "Image is missing from the local Git LFS cache"))
+            object))))))
+
+(defun neo-git--clip-preview (file directory)
+  "Extract the saved canvas preview from the CLIP container in FILE."
+  (unless (equal (neo-git--image-bytes file 0 8) "CSFCHUNK")
+    (error "This file is not a CLIP STUDIO PAINT document"))
+  (unless (and (fboundp 'sqlite-available-p) (sqlite-available-p))
+    (error "CLIP preview requires Emacs with SQLite support"))
+  (let ((offset 24) (size (file-attribute-size (file-attributes file))))
+    (catch 'preview
+      (while (<= (+ offset 16) size)
+        (let* ((header (neo-git--image-bytes file offset (+ offset 16)))
+               (chunk-size (cl-loop with n = 0 for i from 8 below 16
+                                    do (setq n (+ (ash n 8) (aref header i))) finally return n))
+               (start (+ offset 16)))
+          (setq offset (+ start chunk-size))
+          (when (> offset size) (error "Truncated CLIP chunk"))
+          (when (string-prefix-p "CHNKSQLi" header)
+            (let ((database (expand-file-name "canvas.sqlite" directory))
+                  (coding-system-for-write 'no-conversion))
+              (while (< start offset)
+                (let ((end (min offset (+ start (* 1024 1024)))))
+                  (write-region (neo-git--image-bytes file start end) nil database t 'silent)
+                  (setq start end)))
+              (let ((db (sqlite-open database)))
+                (unwind-protect
+                    (progn
+                      (sqlite-execute db "PRAGMA trusted_schema=OFF")
+                      (sqlite-execute db "PRAGMA query_only=ON")
+                      (throw 'preview
+                             (or (caar (sqlite-select db "SELECT ImageData FROM CanvasPreview WHERE length(ImageData) BETWEEN 1 AND 16777216 LIMIT 1"))
+                                 (error "No saved canvas preview in this document"))))
+                  (sqlite-close db)))))))
+      (error "Missing CLIP canvas database"))))
+
+(defun neo-git--image-worker ()
+  "Produce one preview in a separate batch Emacs, outside the interactive UI."
+  (pcase-let* ((`(,directory ,git ,magick ,format ,rev ,path) command-line-args-left)
+               (output (expand-file-name "preview" directory))
+               (file (if (equal rev "worktree") (expand-file-name path)
+                       (expand-file-name "blob" directory)))
+               (coding-system-for-write 'no-conversion))
+    (setq command-line-args-left nil)
+    (condition-case err
+        (progn
+          (unless (equal rev "worktree")
+            (let ((coding-system-for-write (if (eq system-type 'windows-nt)
+                                               w32-system-coding-system 'utf-8-unix)))
+              (unless (eq 0 (call-process git nil (list (list :file file) nil) nil
+                                          "cat-file" "blob" (concat (if (equal rev "") ":0" rev) ":" path)))
+                (error "Cannot read this image from Git"))))
+          (unless (and (file-regular-p file) (not (file-symlink-p file)))
+            (error "No regular image file at this path"))
+          (setq file (neo-git--image-lfs-file git file))
+          (cond
+           ((equal format "CLIP")
+            (write-region (neo-git--clip-preview file directory) nil output nil 'silent))
+           ((not (string-empty-p magick))
+            ;; The explicit decoder reads stdin so paths containing brackets
+            ;; or wildcards are treated literally.
+            (let ((default-directory directory))
+              (unless (eq 0 (call-process magick file (list (list :file output) nil) nil
+                                          "-limit" "memory" "128MiB" "-limit" "map" "256MiB"
+                                          "-limit" "disk" "1GiB" "-limit" "time" "45"
+                                          (concat format ":-[0]") "-auto-orient" "-thumbnail"
+                                          "1200x900>" "-colorspace" "sRGB" "-strip" "PNG32:-"))
+                (error "ImageMagick could not read this %s image" format))))
+           ((member format '("PSD" "PSB"))
+            (error "Install ImageMagick 7 (magick) to preview PSD and PSB"))
+           ((> (file-attribute-size (file-attributes file)) (* 16 1024 1024))
+            (error "ImageMagick is required to resize this large image"))
+           (t (copy-file file output)))
+          (kill-emacs 0))
+      (error (princ (error-message-string err))
+             (kill-emacs 1)))))
+
+(defvar-local neo-git--image-request nil)
+
+(defun neo-git--remove-image-directory (directory &optional delay)
+  ;; A cancelled Windows decoder can briefly retain a handle to its input.
+  (condition-case err
+      (delete-directory directory t)
+    (file-missing nil)
+    (file-error
+     (let ((delay (or delay 1)))
+       (if (<= delay 32)
+           (run-at-time delay nil #'neo-git--remove-image-directory directory (* 2 delay))
+         (message "Cannot remove preview directory %s: %s" directory (error-message-string err)))))))
+
+(defun neo-git--image-preview (owner preview path rev)
+  "Start a read-only preview of PATH at REV in PREVIEW."
+  (let* ((root (buffer-local-value 'neo-git-root owner))
+         (source (current-buffer))
+         (generation (buffer-local-value 'neo-git--diff-generation owner))
+         (request (list path rev))
+         (format (neo-git--image-format path))
+         (directory (make-temp-file "neo-git-image-" t))
+         (output (expand-file-name "preview" directory))
+         (label (format "%s  [%s]" (neo-git--display-path path)
+                        (if (equal rev "") "index" rev))))
+    (with-current-buffer preview
+      (special-mode)
+      (setq-local neo-git--diff-owner owner neo-git--image-request request
+                  header-line-format " Image preview")
+      (neo-git--use-preview-map)
+      (let ((inhibit-read-only t)) (erase-buffer) (insert label "\nLoading image…")))
+    (neo-git--run-command
+     root (list (expand-file-name invocation-name invocation-directory) "-Q" "--batch"
+                "-l" neo-git--image-library "-f" "neo-git--image-worker"
+                directory (neo-git--executable) (or (executable-find "magick") "")
+                format rev path)
+     (lambda (status stdout stderr)
+       (unwind-protect
+           (when (and (buffer-live-p owner) (buffer-live-p preview)
+                      (eq request (buffer-local-value 'neo-git--image-request preview))
+                      (or (not (eq source owner))
+                          (= generation (buffer-local-value 'neo-git--diff-generation owner))))
+             (with-current-buffer source (setq neo-git--diff-process nil))
+             (with-current-buffer preview
+               (let ((inhibit-read-only t))
+                 (erase-buffer) (insert label "\n\n")
+                 (condition-case err
+                     (cond
+                      ((not (eq status 0))
+                       (insert (format "[Preview unavailable: %s]"
+                                       (string-trim (if (string-empty-p stdout) stderr stdout)))))
+                      ((not (display-images-p)) (insert "[Image display requires a graphical frame]"))
+                      (t
+                       (let* ((data (neo-git--image-bytes output))
+                              (window (or (get-buffer-window preview t) (selected-window)))
+                              (img (create-image data nil t :max-width (window-body-width window t)
+                                                 :max-height (max 64 (- (window-body-height window t) 48)))))
+                         (unless img (error "Unsupported image data"))
+                         (insert-image img))))
+                   (error (insert (format "[Preview unavailable: %s]" (error-message-string err)))))
+                 (goto-char (point-min)))))
+         (neo-git--remove-image-directory directory)))
+     4096 nil (list "image-preview" rev path))))
+
 (defun neo-git--preview-selected ()
   (neo-git--invalidate-stage-prefetch)
   (let* ((entry (neo-git--entry-at-point))
          (buffer (current-buffer))
          (preview neo-git--preview-buffer)
-         (key (and entry (neo-git--preview-cache-key
+         (image (and entry (display-images-p) (not (plist-get entry :submodule))
+                     (neo-git--image-format (plist-get entry :path))))
+         (key (and entry (not image) (neo-git--preview-cache-key
                           (plist-get entry :path) (plist-get entry :kind)
                           (plist-get entry :old-path))))
          (cached (and key (assoc key neo-git--preview-cache)))
@@ -1025,7 +1200,14 @@ and index changes between refreshes, including edits with unchanged mtime."
       (setq preview (generate-new-buffer (format "*Neo Git Diff: %s*" (secure-hash 'sha1 neo-git-root))))
       (neo-git--set-preview-buffer preview))
     (if (and entry preview (buffer-live-p preview))
-        (if (eq (plist-get entry :kind) 'untracked)
+        (cond
+         (image
+          (let* ((staged (eq (plist-get entry :kind) 'staged))
+                 (rev (cond ((plist-get entry :deleted) (if staged "HEAD" ""))
+                            (staged "") (t "worktree"))))
+            (setq neo-git--diff-process
+                  (neo-git--image-preview buffer preview (plist-get entry :path) rev))))
+         ((eq (plist-get entry :kind) 'untracked)
             (let ((file (expand-file-name (plist-get entry :path) neo-git-root)))
               (with-current-buffer preview
                 (let ((inhibit-read-only t))
@@ -1049,11 +1231,11 @@ and index changes between refreshes, including edits with unchanged mtime."
                               neo-git--diff-generation generation
                               neo-git--diff-updating nil
                               header-line-format '(:eval (neo-git--diff-header-line)))
-                  (neo-git--use-preview-map))))
+                  (neo-git--use-preview-map)))))
+         (t
           (let ((kind (plist-get entry :kind))
                 (path (plist-get entry :path))
                 (old (plist-get entry :old-path)))
-            (let ()
               (if cached
                   (progn
                     (setq preview (cdr cached))
@@ -2300,6 +2482,7 @@ With DISCARD, revert the selected unstaged lines/hunks in the worktree."
                                                         (plist-get entry :old-path))))))))
          (candidate (and single (neo-git--next-source-entry single)))
          (prefetch (and candidate
+                        (not (and (display-images-p) (neo-git--image-format (plist-get candidate :path))))
                         (not (plist-get candidate :old-path))
                         (memq (plist-get candidate :kind) '(unstaged staged))
                         (not (and staged
@@ -2854,6 +3037,7 @@ C-c C-c saves and continues; C-c C-k cancels this editor invocation."
     (define-key map (kbd "R") #'neo-git-branch-rename)
     (define-key map (kbd "B") #'neo-git-browser-create-branch)
     (define-key map (kbd "a") #'neo-git-history-toggle-all)
+    (define-key map (kbd "i") #'neo-git-history-image)
     (define-key map (kbd "C") #'neo-git-cherry-pick)
     (define-key map (kbd "q") #'neo-git-browser-quit)
     (define-key map (kbd "TAB") #'neo-git-browser-quit)
@@ -2884,6 +3068,7 @@ In stash lists, SPC: apply without deleting; d: delete with confirmation."
       (kbd "SPC") #'neo-git-browser-select (kbd "d") #'neo-git-browser-delete
       (kbd "D") #'neo-git-branch-force-delete (kbd "R") #'neo-git-branch-rename
       (kbd "B") #'neo-git-browser-create-branch (kbd "a") #'neo-git-history-toggle-all
+      (kbd "i") #'neo-git-history-image
       (kbd "C") #'neo-git-cherry-pick (kbd "TAB") #'neo-git-browser-quit (kbd "<backtab>") #'neo-git-browser-quit
       (kbd "q") #'neo-git-browser-quit (kbd "<escape>") #'neo-git-browser-quit)))
 
@@ -3090,6 +3275,38 @@ One row per commit: ● commit, ○ merge, <─┐ merged branch, ─┘ fork po
   (setq neo-git--history-all (not neo-git--history-all))
   (neo-git-browser-refresh))
 
+(defun neo-git-history-image ()
+  "Preview an image changed by the selected commit, including deleted images."
+  (interactive)
+  (unless (eq neo-git--browser-kind 'history) (user-error "Open the commit history first"))
+  (unless (display-images-p) (user-error "Image preview requires a graphical frame"))
+  (let* ((oid (or (tabulated-list-get-id) (user-error "Select a commit")))
+         (owner neo-git--diff-owner)
+         (root neo-git-root)
+         (choices
+          (with-temp-buffer
+            (let ((coding-system-for-read 'utf-8-unix))
+              (unless (zerop (process-file (neo-git--executable) nil t nil "-C" root
+                                           "diff-tree" "--root" "--diff-merges=first-parent" "-r"
+                                           "--no-commit-id" "--no-renames" "--name-status" "-z" oid "--"))
+                (user-error "Cannot list images: %s" (string-trim (buffer-string)))))
+            (cl-loop for (status path) on (split-string (buffer-string) "\0" t) by #'cddr
+                     when (neo-git--image-format path)
+                     collect (cons path (if (equal status "D") (concat oid "^1") oid))))))
+    (unless choices (user-error "This commit has no changed images"))
+    (let* ((choice (if (cdr choices)
+                       (assoc (completing-read "Changed image: " choices nil t) choices)
+                     (car choices)))
+           (preview (get-buffer-create (format "*Neo Git Image: %s*" root)))
+           (window (buffer-local-value 'neo-git--preview-window owner)))
+      (with-current-buffer preview
+        (when (process-live-p neo-git--diff-process)
+          (delete-process neo-git--diff-process))
+        (setq neo-git--diff-process (neo-git--image-preview owner preview (car choice) (cdr choice))))
+      (if (window-live-p window)
+          (progn (set-window-buffer window preview) (select-window window))
+        (pop-to-buffer preview)))))
+
 (defun neo-git--history-header-line ()
   "Show history scope and the current branch's upstream status."
   (let* ((state (and (buffer-live-p neo-git--diff-owner)
@@ -3098,7 +3315,7 @@ One row per commit: ● commit, ○ merge, <─┐ merged branch, ─┘ fork po
     (neo-git--mode-line-literal
      (concat " " (when tracking (concat (plist-get state :branch) tracking "  |  "))
              (if neo-git--history-all "All branches" "Current branch")
-             ", latest 100  RET: diff  a: all/current  B: branch here"
+             ", latest 100  RET: diff  i: image  a: all/current  B: branch here"
              "  C: cherry-pick  q/TAB: list"))))
 
 (defun neo-git--branch-entries (output)
