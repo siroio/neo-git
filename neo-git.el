@@ -185,10 +185,11 @@ LIMIT bounds captured stdout; exceeding it reports `output-limit'."
                      (append (list "-C" (expand-file-name directory)) arguments))
      callback limit stdin arguments)))
 
-(defun neo-git--run-command (directory command callback &optional limit stdin log-arguments)
+(defun neo-git--run-command (directory command callback &optional limit stdin log-arguments first-line)
   "Run an argument-vector COMMAND asynchronously in DIRECTORY.
 CALLBACK receives status, stdout and stderr.  LIMIT and STDIN bound output
-and provide optional UTF-8 input.  LOG-ARGUMENTS preserves the Git log format."
+and provide optional UTF-8 input.  LOG-ARGUMENTS preserves the Git log format.
+When supplied, call FIRST-LINE once with the first complete stdout line."
   (let ((source (current-buffer))
         (owner (or (neo-git--owner-buffer) (current-buffer)))
         (default-directory (file-name-as-directory (expand-file-name directory)))
@@ -242,7 +243,12 @@ and provide optional UTF-8 input.  LOG-ARGUMENTS preserves the Git log format."
                    (process-put proc 'neo-git-bytes bytes)
                    (with-current-buffer buffer
                      (goto-char (point-max))
-                     (insert chunk))))))))
+                     (insert chunk)
+                     (when (and first-line (string-search "\n" chunk))
+                       (goto-char (point-min))
+                       (let ((notify first-line))
+                         (setq first-line nil)
+                         (funcall notify (string-trim-right (buffer-substring (point) (line-end-position)))))))))))))
       (condition-case failure
           (progn
             (setq process
@@ -1025,22 +1031,23 @@ and index changes between refreshes, including edits with unchanged mtime."
     (if (not (string-prefix-p "version https://git-lfs.github.com/spec/v1" header)) file
       (unless (string-match "^oid sha256:\\([0-9a-f]\\{64\\}\\)\r?$" header)
         (error "Invalid Git LFS pointer"))
-      (let ((oid (match-string 1 header)))
-        (with-temp-buffer
-          (let ((coding-system-for-read 'utf-8-unix))
-            (unless (and (eq 0 (call-process git nil t nil "lfs" "env"))
-                         (progn (goto-char (point-min)) (re-search-forward "^LocalMediaDir=\\(.+\\)$" nil t)))
-              (error "Cannot locate the local Git LFS cache")))
-          (let* ((media (string-trim-right (match-string 1)))
-                 (object (expand-file-name (format "%s/%s/%s" (substring oid 0 2) (substring oid 2 4) oid)
-                                           media)))
-            (unless (file-readable-p object) (error "Image is missing from the local Git LFS cache"))
-            object))))))
+      (let* ((oid (match-string 1 header))
+             (relative (format "%s/%s/%s" (substring oid 0 2) (substring oid 2 4) oid))
+             (object (expand-file-name relative ".git/lfs/objects/")))
+        ;; Most clones already hold this exact object at the standard location.
+        ;; Ask LFS for its media directory for linked worktrees and custom storage.
+        (unless (and (not (getenv "GIT_DIR")) (not (getenv "GIT_COMMON_DIR")) (file-readable-p object))
+          (with-temp-buffer
+            (let ((coding-system-for-read 'utf-8-unix))
+              (unless (and (eq 0 (call-process git nil t nil "lfs" "env"))
+                           (progn (goto-char (point-min)) (re-search-forward "^LocalMediaDir=\\(.+\\)$" nil t)))
+                (error "Cannot locate the local Git LFS cache")))
+            (setq object (expand-file-name relative (string-trim-right (match-string 1))))
+            (unless (file-readable-p object) (error "Image is missing from the local Git LFS cache"))))
+        object))))
 
 (defun neo-git--clip-preview (file directory)
   "Extract the saved canvas preview from the CLIP container in FILE."
-  (unless (equal (neo-git--image-bytes file 0 8) "CSFCHUNK")
-    (error "This file is not a CLIP STUDIO PAINT document"))
   (unless (and (fboundp 'sqlite-available-p) (sqlite-available-p))
     (error "CLIP preview requires Emacs with SQLite support"))
   (let ((offset 24) (size (file-attribute-size (file-attributes file))))
@@ -1080,8 +1087,7 @@ and index changes between refreshes, including edits with unchanged mtime."
 
 (defun neo-git--image-input (directory git format rev path)
   "Materialize the image at REV and return its local (FILE . FORMAT)."
-  (let* ((file (if (equal rev "worktree") (expand-file-name path) (expand-file-name "blob" directory)))
-         (coding-system-for-write 'no-conversion))
+  (let ((file (if (equal rev "worktree") (expand-file-name path) (expand-file-name "blob" directory))))
     (unless (equal rev "worktree")
       (let ((coding-system-for-write (if (eq system-type 'windows-nt)
                                         w32-system-coding-system 'utf-8-unix)))
@@ -1091,13 +1097,18 @@ and index changes between refreshes, including edits with unchanged mtime."
     (unless (and (file-regular-p file) (not (file-symlink-p file)))
       (error "No regular image file at %s" path))
     (setq file (neo-git--image-lfs-file git file))
-    (when (equal format "CLIP")
-      (let ((data (neo-git--clip-preview file directory)))
-        (setq file (expand-file-name "canvas" directory))
-        (write-region data nil file nil 'silent)
-        (setq format (pcase (image-type-from-data data)
-                       ('png "PNG") ('jpeg "JPEG") (_ (error "Unsupported CLIP canvas image"))))))
+    (when (and (equal format "CLIP") (not (equal (neo-git--image-bytes file 0 8) "CSFCHUNK")))
+      (error "This file is not a CLIP STUDIO PAINT document"))
     (cons file format)))
+
+(defun neo-git--unpack-clip (input directory)
+  (if (not (equal (cdr input) "CLIP")) input
+    (let ((data (neo-git--clip-preview (car input) directory))
+          (file (expand-file-name "canvas" directory))
+          (coding-system-for-write 'no-conversion))
+      (write-region data nil file nil 'silent)
+      (cons file (pcase (image-type-from-data data)
+                   ('png "PNG") ('jpeg "JPEG") (_ (error "Unsupported CLIP canvas image")))))))
 
 (defun neo-git--render-image-file (directory magick input &optional full)
   "Write a preview in DIRECTORY.  For FULL also save pixels and return dimensions."
@@ -1165,22 +1176,38 @@ and index changes between refreshes, including edits with unchanged mtime."
 (defun neo-git--clean-wic ()
   (when neo-git--wic-directory (ignore-errors (delete-directory neo-git--wic-directory t))))
 
+(defun neo-git--wic-build-command (temporary)
+  (let ((refs (expand-file-name "WPF/" (file-name-directory neo-git--wic-compiler))))
+    (list neo-git--wic-compiler "/nologo" "/noconfig" "/optimize+" "/unsafe+"
+          "/r:System.dll" "/r:System.Core.dll" "/r:System.Xaml.dll" (concat "/r:" refs "WindowsBase.dll")
+          (concat "/r:" refs "PresentationCore.dll") (concat "/out:" temporary)
+          (subst-char-in-string ?/ ?\\ neo-git--wic-source))))
+
+(defun neo-git--wic-finish-build (status temporary program)
+  (unwind-protect
+      (when (eq status 0)
+        (condition-case nil (rename-file temporary program) (file-already-exists nil)))
+    (when (file-exists-p temporary) (delete-file temporary))))
+
 (defun neo-git--wic-program (cache)
   ;; Called only by a batch worker. Concurrent workers may finish compiling together.
   (let ((program (expand-file-name "image.exe" cache)))
     (unless (file-exists-p program)
       (let* ((default-directory (file-name-as-directory cache))
-             (refs (expand-file-name "WPF/" (file-name-directory neo-git--wic-compiler)))
-             (temporary (make-temp-file (expand-file-name "build-" cache) nil ".exe")))
-        (unwind-protect
-            (when (eq 0 (call-process neo-git--wic-compiler nil nil nil "/nologo" "/noconfig" "/optimize+" "/unsafe+"
-                                      "/r:System.dll" "/r:System.Xaml.dll" (concat "/r:" refs "WindowsBase.dll")
-                                      (concat "/r:" refs "PresentationCore.dll")
-                                      (concat "/out:" temporary)
-                                      (subst-char-in-string ?/ ?\\ neo-git--wic-source)))
-              (condition-case nil (rename-file temporary program) (file-already-exists nil)))
-          (when (file-exists-p temporary) (delete-file temporary)))))
+             (temporary (make-temp-file (expand-file-name "build-" cache) nil ".exe"))
+             (command (neo-git--wic-build-command temporary)))
+        (neo-git--wic-finish-build (apply #'call-process (car command) nil nil nil (cdr command))
+                                   temporary program)))
     (and (file-exists-p program) program)))
+
+(defun neo-git--render-wic (program directory new old)
+  (when program
+    (with-temp-buffer
+      (let ((default-directory (file-name-as-directory directory))
+            (coding-system-for-write w32-system-coding-system))
+        (when (eq 0 (apply #'call-process program nil '(t nil) nil (car new)
+                           (when old (list (car old)))))
+          (buffer-string))))))
 
 (defun neo-git--image-worker ()
   "Produce a preview or a two-revision comparison in a separate batch Emacs."
@@ -1189,19 +1216,16 @@ and index changes between refreshes, including edits with unchanged mtime."
     (condition-case err
         (let* ((new-dir (if before (expand-file-name "after" directory) directory))
                (old-dir (expand-file-name "before" directory))
-               (new (progn (when before (make-directory new-dir))
+               (new (progn (when before (make-directory new-dir t))
                            (neo-git--image-input new-dir git format rev path)))
-               (old (when before (make-directory old-dir)
+               (old (when before (make-directory old-dir t)
                       (apply #'neo-git--image-input old-dir git before)))
                (program (unless (string-empty-p cache) (neo-git--wic-program cache)))
-               (native-result
-                (when program
-                  (with-temp-buffer
-                    (let ((default-directory (file-name-as-directory directory))
-                          (coding-system-for-write w32-system-coding-system))
-                      (when (eq 0 (apply #'call-process program nil '(t nil) nil (car new)
-                                         (when old (list (car old)))))
-                        (buffer-string)))))))
+               (native-result (neo-git--render-wic program directory new old)))
+          (when (and (not native-result) (or (equal (cdr new) "CLIP") (equal (cdr old) "CLIP")))
+            (setq new (neo-git--unpack-clip new new-dir)
+                  old (neo-git--unpack-clip old old-dir)
+                  native-result (neo-git--render-wic program directory new old)))
           (cond (native-result (princ native-result))
                 ((not old) (neo-git--render-image-file directory magick new))
                 ((string-empty-p magick)
@@ -1273,10 +1297,24 @@ and index changes between refreshes, including edits with unchanged mtime."
       (append (list "rev-parse" "--end-of-options" (funcall spec rev path))
               (when (consp diff) (list (funcall spec (car diff) (cdr diff))))))))
 
-(defun neo-git--image-cached-load (owner source preview request generation root versions layout load-image)
+(defun neo-git--image-cached-load (owner source preview request generation root versions decoder layout load-image)
   "Validate inputs asynchronously and reuse up to four rendered images per status buffer."
   (cl-labels
-      ((current-p ()
+      ((version (callback)
+         (if (and decoder (file-exists-p decoder) (equal (car versions) "hash-object"))
+             (neo-git--run-command root (append (list decoder "--stamp") (nthcdr 3 versions))
+                                   (lambda (status ids err)
+                                     (funcall callback status (replace-regexp-in-string "\r" "" ids) err))
+                                   4096 nil (list "image-version" (nth 3 versions)))
+           (neo-git--run root versions callback)))
+       (start ()
+         (if (and decoder (file-exists-p decoder) (equal (car versions) "hash-object")
+                  (not (cl-find layout (buffer-local-value 'neo-git--image-cache owner)
+                                :key #'cdar :test #'equal)))
+             ;; No matching row to reuse. The decoder captures its own input versions.
+             (lookup nil nil nil)
+           (version #'lookup)))
+       (current-p ()
          (and (buffer-live-p owner) (buffer-live-p source) (buffer-live-p preview)
               (eq request (buffer-local-value 'neo-git--image-request preview))
               (or (not (eq source owner)) (= generation (buffer-local-value 'neo-git--diff-generation owner)))
@@ -1287,8 +1325,7 @@ and index changes between refreshes, including edits with unchanged mtime."
            (let ((rendered (with-current-buffer preview (buffer-string))))
              (with-current-buffer source
                (setq neo-git--diff-process
-                     (neo-git--run
-                      root versions
+                     (version
                       (lambda (status ids _)
                         (when (current-p)
                           (with-current-buffer source (setq neo-git--diff-process nil))
@@ -1304,7 +1341,11 @@ and index changes between refreshes, including edits with unchanged mtime."
                   (hit (and key (assoc key (buffer-local-value 'neo-git--image-cache owner)))))
              (with-current-buffer source
                (if (not hit)
-                   (setq neo-git--diff-process (funcall load-image (lambda () (remember key))))
+                   (setq neo-git--diff-process
+                         (funcall load-image
+                                  (lambda (&optional ids)
+                                    (remember (or key (and ids (cons ids layout)))))
+                                  (and (not key) (equal (car versions) "hash-object") (nthcdr 3 versions))))
                  (setq neo-git--diff-process nil)
                  (with-current-buffer owner
                    (setq neo-git--image-cache (cons hit (delq hit neo-git--image-cache))))
@@ -1314,8 +1355,19 @@ and index changes between refreshes, including edits with unchanged mtime."
                    (when-let* ((window (get-buffer-window preview t)))
                      (set-window-point window (point-min))
                      (set-window-start window (point-min))))))))))
-    (if versions (neo-git--run root versions #'lookup)
-      (funcall load-image #'ignore))))
+    (cond
+     ((not versions) (funcall load-image #'ignore nil))
+     ((or (not decoder) (file-exists-p decoder)) (start))
+     (t
+      (let* ((cache (file-name-directory decoder))
+             (temporary (make-temp-file (expand-file-name "build-" cache) nil ".exe")))
+        (neo-git--run-command
+         cache (neo-git--wic-build-command temporary)
+         (lambda (status _out _err)
+           (neo-git--wic-finish-build status temporary decoder)
+           (when (current-p)
+             (with-current-buffer source (setq neo-git--diff-process (start)))))
+         4096 nil '("build image decoder")))))))
 
 (defun neo-git--image-preview (owner preview path rev comparison show-diff)
   "Preview PATH at REV, optionally showing its COMPARISON when SHOW-DIFF is set.
@@ -1336,6 +1388,9 @@ COMPARISON is (old-rev . old-path), `added' or `deleted'."
          (diff (and show-diff comparison))
          (magick (executable-find "magick"))
          (wic (neo-git--wic-directory))
+         (versions (neo-git--image-version-command root path rev diff))
+         (decoder (and versions wic (member (neo-git--image-format path) '("PSD" "PSB" "CLIP"))
+                       (expand-file-name "image.exe" wic)))
          (window (or (get-buffer-window preview t) (selected-window)))
          (label (format "%s  [%s]" (neo-git--display-path path) (neo-git--image-revision-label rev))))
     (with-current-buffer preview
@@ -1345,35 +1400,79 @@ COMPARISON is (old-rev . old-path), `added' or `deleted'."
       (neo-git--use-preview-map neo-git-image-mode-map)
       (let ((inhibit-read-only t)) (erase-buffer) (insert label "\nLoading image…")))
     (neo-git--image-cached-load
-     owner source preview request generation root (neo-git--image-version-command root path rev diff)
+     owner source preview request generation root versions decoder
      (list root path rev diff magick wic (window-body-width window t) (window-body-height window t))
-     (lambda (done)
-       (neo-git--load-image owner preview request path rev diff magick wic label done)))))
+     (lambda (done stamp-paths)
+       (neo-git--load-image owner preview request path rev diff magick wic label done
+                            (and decoder (file-exists-p decoder) decoder) stamp-paths)))))
 
-(defun neo-git--load-image (owner preview request path rev diff magick wic label done)
+(defun neo-git--run-artwork (root directory direct portable active first-line finish log-args)
+  "Try the native artwork reader, then the batch worker for unsupported inputs."
+  (let ((source (current-buffer)) retry)
+    (if (not direct) (neo-git--run-command root portable finish 4096 nil log-args)
+      (or (neo-git--run-command
+           directory direct
+           (lambda (status out err)
+             (if (and (or (eq status 1) (consp status)) (funcall active))
+                 (with-current-buffer source
+                   (setq retry (neo-git--run-command root portable finish 4096 nil log-args)
+                         neo-git--diff-process retry))
+               (funcall finish status out err t)))
+           4096 nil log-args first-line)
+          retry)))) ; A process-start error invokes the callback synchronously.
+
+(defun neo-git--load-image (owner preview request path rev diff magick wic label done &optional direct stamp-paths)
   (let* ((source (current-buffer))
          (root (buffer-local-value 'neo-git-root owner))
          (generation (buffer-local-value 'neo-git--diff-generation owner))
          (compare-pixels (and (or wic magick) (consp diff)))
          (directory (make-temp-file "neo-git-image-" t))
-         (output (expand-file-name "preview" directory)))
-    (neo-git--run-command
-     root (append (list (expand-file-name invocation-name invocation-directory) "-Q" "--batch"
+         (output (expand-file-name "preview" directory))
+         (active (lambda ()
+                   (and (buffer-live-p owner) (buffer-live-p source) (buffer-live-p preview)
+                        (not (buffer-local-value 'neo-git--closed owner))
+                        (eq request (buffer-local-value 'neo-git--image-request preview))
+                        (or (not (eq source owner))
+                            (= generation (buffer-local-value 'neo-git--diff-generation owner))))))
+         (mask (expand-file-name "difference" directory))
+         (insert-mask (lambda (summary window)
+                        (insert summary "\nDifference (pink = changed)\n")
+                        (neo-git--insert-preview-image mask window)))
+         shown)
+    (neo-git--run-artwork
+     root directory
+     (when direct
+       (append (list direct "--git-art" root (neo-git--executable) rev path
+                     (if compare-pixels (car diff) "") (if compare-pixels (cdr diff) "")) stamp-paths))
+     (append (list (expand-file-name invocation-name invocation-directory) "-Q" "--batch"
                         "-l" neo-git--image-library "-f" "neo-git--image-worker"
                         directory (neo-git--executable) (or magick "") (or wic "")
                         (neo-git--image-format path) rev path)
                   (when compare-pixels
                     (list (neo-git--image-format (cdr diff)) (car diff) (cdr diff))))
-     (lambda (status stdout stderr)
+     active
+     (lambda (summary)
+       ;; The decoder flushes this line only after closing the complete mask.
+       (when (and compare-pixels (funcall active) (display-images-p))
+         (with-current-buffer preview
+           (let ((inhibit-read-only t))
+             (condition-case nil
+                 (progn
+                   (erase-buffer) (insert label "\n\n")
+                   (funcall insert-mask summary (or (get-buffer-window preview t) (selected-window)))
+                   (goto-char (point-min))
+                   (setq shown summary))
+               (error nil))))))
+     (lambda (status stdout stderr &optional native)
        (unwind-protect
-           (when (and (buffer-live-p owner) (buffer-live-p preview)
-                      (eq request (buffer-local-value 'neo-git--image-request preview))
-                      (or (not (eq source owner))
-                          (= generation (buffer-local-value 'neo-git--diff-generation owner))))
+           (when (funcall active)
              (with-current-buffer source (setq neo-git--diff-process nil))
              (with-current-buffer preview
-               (let ((inhibit-read-only t))
-                 (erase-buffer) (insert label "\n\n")
+               (let* ((inhibit-read-only t)
+                      (summary (string-trim stdout))
+                      (keep (and native (eq status 0) (equal shown summary)))
+                      (previous-point (point)))
+                 (if keep (goto-char (point-max)) (erase-buffer) (insert label "\n\n"))
                  (condition-case err
                      (cond
                       ((not (eq status 0))
@@ -1382,10 +1481,9 @@ COMPARISON is (old-rev . old-path), `added' or `deleted'."
                       ((not (display-images-p)) (insert "[Image display requires a graphical frame]"))
                       (t
                        (let ((window (or (get-buffer-window preview t) (selected-window))))
-                         (if (and compare-pixels (file-exists-p (expand-file-name "difference" directory)))
+                         (if (and compare-pixels (file-exists-p mask))
                              (progn
-                               (insert (string-trim stdout) "\nDifference (pink = changed)\n")
-                               (neo-git--insert-preview-image (expand-file-name "difference" directory) window)
+                               (unless keep (funcall insert-mask summary window))
                                (insert "\nBefore  " (neo-git--display-path (cdr diff)) "  ["
                                        (neo-git--image-revision-label (car diff)) "]\n")
                                (neo-git--insert-preview-image (expand-file-name "before/preview" directory) window)
@@ -1398,15 +1496,18 @@ COMPARISON is (old-rev . old-path), `added' or `deleted'."
                                                        "Pixel comparison requires a Windows image decoder or ImageMagick 7."
                                                      (string-trim stdout)) "\n")))
                            (neo-git--insert-preview-image output window))
-                         (when (or (not (consp diff)) (file-exists-p (expand-file-name "difference" directory)))
-                           (funcall done)))))
+                         (when (or (not (consp diff)) (file-exists-p mask))
+                           (let ((versions (expand-file-name "versions" directory)))
+                             (funcall done (and direct (file-readable-p versions)
+                                                (neo-git--image-bytes versions))))))))
                    (error (insert (format "[Preview unavailable: %s]" (error-message-string err)))))
-                 (goto-char (point-min))
-                 (when-let* ((window (get-buffer-window preview t)))
-                   (set-window-point window (point-min))
-                   (set-window-start window (point-min))))))
+                 (if keep (goto-char previous-point)
+                   (goto-char (point-min))
+                   (when-let* ((window (get-buffer-window preview t)))
+                     (set-window-point window (point-min))
+                     (set-window-start window (point-min)))))))
          (neo-git--remove-image-directory directory)))
-     4096 nil (list (if diff "image-diff" "image-preview") rev path))))
+     (list (if diff "image-diff" "image-preview") rev path))))
 
 (defun neo-git-image-diff ()
   "Compare the image on the selected status or commit history row."

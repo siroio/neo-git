@@ -45,9 +45,47 @@
            (uint64 (lambda (n) (apply #'unibyte-string
                                       (cl-loop for shift from 56 downto 0 by 8
                                                collect (logand (ash n (- shift)) 255))))))
-      (write-region (concat "CSFCHUNK" (funcall uint64 (+ 56 (length bytes))) (funcall uint64 24)
+      ;; Real artwork has unrelated chunks before the non-page-aligned database.
+      (write-region (concat "CSFCHUNK" (funcall uint64 (+ 75 (length bytes))) (funcall uint64 24)
+                            "CHNKExta" (funcall uint64 3) "abc"
                             "CHNKSQLi" (funcall uint64 (length bytes)) bytes
                             "CHNKFoot" (funcall uint64 0)) nil "drawing.clip" nil 'silent))))
+
+(ert-deftest neo-git-image-windows-large-file-version ()
+  (skip-unless (neo-git--wic-directory))
+  (let ((program (neo-git--wic-program (neo-git--wic-directory)))
+        (file (make-temp-file "neo-git-large-art-" nil ".psd"))
+        (coding-system-for-write 'no-conversion))
+    (unwind-protect
+        (progn
+          (write-region "a" nil file (1+ (* 1024 1024)) 'silent)
+          (let ((mtime (file-attribute-modification-time (file-attributes file)))
+                (version (neo-git-image-check--run program "--stamp" file)))
+            (should (equal version (neo-git-image-check--run program "--stamp" file)))
+            (write-region "b" nil file 100 'silent)
+            (set-file-times file mtime)
+            (should-not (equal version (neo-git-image-check--run program "--stamp" file)))))
+      (delete-file file))))
+
+(ert-deftest neo-git-image-windows-photoshop-embedded-profile ()
+  (skip-unless (and (neo-git--wic-directory) (executable-find "magick")))
+  (let ((profile (expand-file-name "System32/spool/drivers/color/sRGB Color Space Profile.icm"
+                                   (getenv "SystemRoot"))))
+    (skip-unless (file-readable-p profile))
+    (let* ((root (make-temp-file "neo-git-icc-" t))
+           (default-directory (file-name-as-directory root))
+           (program (neo-git--wic-program (neo-git--wic-directory))))
+      (unwind-protect
+          (progn
+            (make-directory "before") (make-directory "after")
+            (dolist (color '("red" "blue"))
+              (neo-git-image-check--run "magick" "-size" "4x2" (concat "xc:" color)
+                                        "-type" "TrueColor" "-depth" "8" "-profile" profile
+                                        (concat color ".psd")))
+            (should (equal (neo-git-image-check--run program "red.psd" "blue.psd")
+                           "8 changed pixels  |  4x2 -> 4x2"))
+            (should (file-exists-p "difference")))
+        (delete-directory root t)))))
 
 (ert-deftest neo-git-image-windows-without-magick-and-cache-invalidation ()
   (skip-unless (neo-git--wic-directory))
@@ -94,6 +132,56 @@
                 (write-png dot)
                 (neo-git-image-check--run "git" "add" "--" "x.png")
                 (compare-png "0 changed pixels")))))
+      (kill-buffer owner) (kill-buffer preview) (delete-directory root t))))
+
+(ert-deftest neo-git-image-art-first-selection ()
+  (skip-unless (and (neo-git--wic-directory) (executable-find "magick")))
+  (let* ((root (file-name-as-directory (make-temp-file "neo-git-first-art-" t)))
+         (default-directory root)
+         (owner (generate-new-buffer " *first-art-status*"))
+         (preview (generate-new-buffer " *first-art-preview*"))
+         (name "初回 [1].psd")
+         (runner (symbol-function 'neo-git--run-artwork))
+         (renders 0) early-text old-notify)
+    (unwind-protect
+        (with-current-buffer owner
+          (neo-git-mode)
+          (setq default-directory root neo-git-root root neo-git--preview-buffer preview)
+          (neo-git-image-check--run "git" "init" "-q")
+          (cl-letf (((symbol-function 'display-images-p) (lambda (&rest _) t))
+                    ((symbol-function 'neo-git--run-artwork)
+                     (lambda (repo dir direct portable active notify finish log-args)
+                       (cl-incf renders)
+                       (funcall runner repo dir direct portable active
+                                (lambda (line)
+                                  (funcall notify line)
+                                  (setq early-text (with-current-buffer preview (buffer-string))
+                                        old-notify notify))
+                                finish log-args))))
+            (cl-labels ((paint (color)
+                          (neo-git-image-check--run "magick" "-size" "4x2" (concat "xc:" color)
+                                                    "-type" "TrueColor" "-depth" "8" name))
+                        (select-art ()
+                          (setq neo-git--diff-process
+                                (neo-git--image-preview owner preview name "worktree" (cons "" name) t))
+                          (neo-git-image-check--wait owner)))
+              (paint "red")
+              (neo-git-image-check--run "git" "add" "--" name)
+              (paint "blue")
+              (select-art)
+              (should (string-search "8 changed pixels" early-text))
+              (should (text-property-not-all 0 (length early-text) 'display nil early-text))
+              (should-not (string-search "Before  " early-text))
+              (should (string-search "After  " (with-current-buffer preview (buffer-string))))
+              (select-art)
+              (should (= renders 1))
+              ;; An earlier process filter may still have a pending notification.
+              (funcall old-notify "stale")
+              (should (string-search "8 changed pixels" (with-current-buffer preview (buffer-string))))
+              (neo-git-image-check--run "git" "add" "--" name)
+              (select-art)
+              (should (= renders 2))
+              (should (string-search "0 changed pixels" (with-current-buffer preview (buffer-string)))))))
       (kill-buffer owner) (kill-buffer preview) (delete-directory root t))))
 
 (ert-deftest neo-git-image-preview-formats-and-git-versions ()
@@ -159,6 +247,7 @@
             (select-image name 'unstaged)
             (should (= 7 (neo-git-image-check--width preview)))
             (when (executable-find "git-lfs")
+              (neo-git-image-check--run "git" "config" "--local" "lfs.storage" "custom-media")
               (with-temp-buffer
                 (should (eq 0 (process-file "git-lfs" (expand-file-name name) t nil "clean" "--" "art.png")))
                 (write-region (point-min) (point-max) "art.png" nil 'silent))
@@ -166,9 +255,19 @@
               (should (= 7 (neo-git-image-check--width preview))))
             (neo-git-image-check--clip name)
             (copy-file "drawing.clip" "alias.clpi")
+            (when (executable-find "git-lfs")
+              (with-temp-buffer
+                (should (eq 0 (process-file "git-lfs" (expand-file-name "drawing.clip") t nil
+                                            "clean" "--" "stored.clip")))
+                (write-region (point-min) (point-max) "stored.clip" nil 'silent))
+              (select-image "stored.clip" 'untracked)
+              (should (= 7 (neo-git-image-check--width preview))))
             (dolist (path '("drawing.clip" "alias.clpi" "photo.psd" "poster.psb"))
               (when (member path '("photo.psd" "poster.psb")) (make-image-file 7 path))
               (select-image path 'untracked)
+              (should (= 7 (neo-git-image-check--width preview))))
+            (let ((neo-git--wic-compiler nil))
+              (select-image "drawing.clip" 'untracked)
               (should (= 7 (neo-git-image-check--width preview))))
             (with-temp-file "invalid.clpi" (insert "HDMV0200"))
             (select-image "invalid.clpi" 'untracked)
@@ -304,6 +403,8 @@
             (should (= 5 (neo-git-image-check--width preview)))
             (with-current-buffer preview (should-not (string-search "changed pixel" (buffer-string))))
             (commit "change one pixel")
+            (history-diff "drawing.clip")
+            (check-text history "1 changed pixel")
             (history-diff image-path)
             (check-text history "1 changed pixel")
             (neo-git-image-check--run "git" "mv" "--" image-path "renamed.png")
